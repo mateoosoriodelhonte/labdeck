@@ -14,8 +14,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  source:
+    name: Source detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app-present: ${{ steps.detect.outputs.app-present }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect application source
+        id: detect
+        shell: bash
+        run: |
+          if [[ -f pom.xml && -f frontend/package-lock.json ]]; then
+            echo "app-present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "app-present=false" >> "$GITHUB_OUTPUT"
+          fi
+
   frontend-quality:
     name: Frontend quality
+    needs: source
+    if: needs.source.outputs.app-present == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -52,6 +74,8 @@ jobs:
 
   package:
     name: Package application
+    needs: source
+    if: needs.source.outputs.app-present == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
