@@ -243,7 +243,7 @@ class SQLitePersistenceIntegrationTests {
                     .validateOnMigrate(true)
                     .load();
             flyway.migrate();
-            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("1");
+            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
             return dataSource;
         } catch (RuntimeException | AssertionError exception) {
             dataSource.close();

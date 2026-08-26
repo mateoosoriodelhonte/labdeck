@@ -90,4 +90,6 @@ jobs:
           cache: maven
 
       - name: Build executable JAR and run Java tests
+        env:
+          LABDECK_DOCKER_TESTS: "true"
         run: ./mvnw --batch-mode --no-transfer-progress clean package

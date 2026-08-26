@@ -58,6 +58,33 @@ class ProjectPathPolicyTests {
     }
 
     @Test
+    void approvesARealWorkspaceAndDetectsPathReplacement() throws IOException {
+        Path project = Files.createDirectories(temporaryDirectory.resolve("project"));
+        ApprovedWorkspacePath approved = policy.resolveWorkspace(project);
+
+        approved.verifyUnchanged();
+        Path moved = temporaryDirectory.resolve("moved-project");
+        Files.move(project, moved);
+        Files.createDirectories(project);
+
+        assertThatThrownBy(approved::verifyUnchanged)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("workspace changed");
+    }
+
+    @Test
+    void rejectsASymlinkSelectedAsTheWorkspace() throws IOException {
+        Path project = Files.createDirectories(temporaryDirectory.resolve("project"));
+        Path link = temporaryDirectory.resolve("project-link");
+        Files.createSymbolicLink(link, project);
+
+        assertThatThrownBy(() -> policy.resolveWorkspace(link))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception ->
+                        assertThat(exception.problems().getFirst().code())
+                                .isEqualTo(ManifestProblemCode.MANIFEST_HOST_PATH_FORBIDDEN));
+    }
+
+    @Test
     void rejectsAFilesystemRootAsTheWorkspace() {
         Path root = temporaryDirectory.toAbsolutePath().getRoot();
 

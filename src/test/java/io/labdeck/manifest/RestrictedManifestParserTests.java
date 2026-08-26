@@ -290,6 +290,16 @@ class RestrictedManifestParserTests {
                                 """),
                         ManifestProblemCode.MANIFEST_SENSITIVE_MOUNT_FORBIDDEN,
                         "/services/app/volumes/0/target"),
+                Arguments.of("workspace-shadowing volume", minimalManifest("""
+                                services:
+                                  app:
+                                    image: python:3.12
+                                    volumes:
+                                      - name: hidden-workspace
+                                        target: /workspace
+                                """),
+                        ManifestProblemCode.MANIFEST_SENSITIVE_MOUNT_FORBIDDEN,
+                        "/services/app/volumes/0/target"),
                 Arguments.of("invalid memory", minimalManifest("""
                                 services:
                                   app:
