@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: labdeck
+
+server:
+  address: 127.0.0.1
+  port: ${LABDECK_PORT:8787}
+  error:
+    include-message: never
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
