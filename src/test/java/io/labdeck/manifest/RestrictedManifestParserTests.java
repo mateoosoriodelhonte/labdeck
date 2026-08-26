@@ -6,8 +6,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.labdeck.manifest.LabManifest.ImageSource;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -40,6 +38,23 @@ class RestrictedManifestParserTests {
         assertThat(manifest.tests().orElseThrow().command()).containsExactly("pytest", "-q");
         assertThatThrownBy(() -> manifest.services().put("other", manifest.services().get("app")))
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void parsesEveryBuildPortHealthAndVolumeField() throws IOException {
+        LabManifest manifest = parser.parse(fixture("manifests/valid/build-v1.yaml"));
+        LabManifest.Service app = manifest.services().get("app");
+
+        assertThat(app.source()).isEqualTo(new LabManifest.BuildSource("containers/app", "Containerfile"));
+        assertThat(app.workingDirectory()).isEqualTo("/workspace/src");
+        assertThat(app.environment()).containsEntry("LAB_MODE", "development");
+        assertThat(app.ports().getFirst())
+                .isEqualTo(new LabManifest.Port(8000, java.util.Optional.of(18000), "tcp"));
+        assertThat(app.healthcheck().orElseThrow().startPeriod()).isEqualTo(java.time.Duration.ofSeconds(15));
+        assertThat(app.volumes().getFirst())
+                .isEqualTo(new LabManifest.VolumeMount("course-cache", "/data/cache", true));
+        assertThat(manifest.resources().memoryBytes()).isEqualTo(512L * 1024 * 1024);
+        assertThat(manifest.resources().cpus()).isEqualByComparingTo("0.5");
     }
 
     @Test
@@ -141,6 +156,46 @@ class RestrictedManifestParserTests {
         assertThatThrownBy(() -> parser.parse(yaml)).isInstanceOf(ManifestValidationException.class);
     }
 
+    @Test
+    void safeErrorsDoNotRepeatAnUntrustedHostPath() {
+        String secretPath = "/Users/student/private-course";
+        String yaml = """
+                version: 1
+                name: Unsafe
+                workspace:
+                  mount: /workspace
+                  host: %s
+                services:
+                  app:
+                    image: python:3.12
+                """.formatted(secretPath);
+
+        assertThatThrownBy(() -> parser.parse(yaml))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception ->
+                        assertThat(exception.problems())
+                                .extracting(ManifestProblem::message)
+                                .allSatisfy(message -> assertThat(message).doesNotContain(secretPath)));
+    }
+
+    @Test
+    void hostileUnknownFieldNamesAreNotRepeatedInProblemPaths() {
+        String hostileField = "/Users/student/private-course";
+        String yaml = minimalManifest("""
+                services:
+                  app:
+                    image: python:3.12
+                "%s": hidden
+                """.formatted(hostileField));
+
+        assertThatThrownBy(() -> parser.parse(yaml))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception -> {
+                    assertThat(exception.problems()).extracting(ManifestProblem::code)
+                            .contains(ManifestProblemCode.MANIFEST_UNKNOWN_FIELD);
+                    assertThat(exception.problems()).extracting(ManifestProblem::path)
+                            .allSatisfy(path -> assertThat(path).doesNotContain(hostileField));
+                });
+    }
+
     private void assertSingleCode(String yaml, ManifestProblemCode expectedCode) {
         assertThatThrownBy(() -> parser.parse(yaml))
                 .isInstanceOfSatisfying(ManifestValidationException.class,
@@ -175,6 +230,10 @@ class RestrictedManifestParserTests {
                         ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
                 unsafeServiceField("bad host port", "ports: [{container: 8000, host: 0}]",
                         ManifestProblemCode.MANIFEST_PORT_POLICY_VIOLATION, "/services/app/ports/0/host"),
+                unsafeServiceField("wildcard port binding", "ports: [\"0.0.0.0:8000:8000\"]",
+                        ManifestProblemCode.MANIFEST_PORT_POLICY_VIOLATION, "/services/app/ports/0"),
+                unsafeServiceField("host address field", "ports: [{container: 8000, host_ip: \"0.0.0.0\"}]",
+                        ManifestProblemCode.MANIFEST_PORT_POLICY_VIOLATION, "/services/app/ports/0/host_ip"),
                 unsafeServiceField("unknown Docker field", "extra_hosts: [\"host.docker.internal:host-gateway\"]",
                         ManifestProblemCode.MANIFEST_UNKNOWN_FIELD, "/services/app/extra_hosts"),
                 Arguments.of("workspace host path", """
@@ -233,7 +292,23 @@ class RestrictedManifestParserTests {
                                   app:
                                     image: python:latest
                                 """),
-                        ManifestProblemCode.MANIFEST_MUTABLE_IMAGE_TAG_FORBIDDEN, "/services/app/image"));
+                        ManifestProblemCode.MANIFEST_MUTABLE_IMAGE_TAG_FORBIDDEN, "/services/app/image"),
+                Arguments.of("empty name", """
+                                version: 1
+                                name: ""
+                                workspace:
+                                  mount: /workspace
+                                services:
+                                  app:
+                                    image: python:3.12
+                                """,
+                        ManifestProblemCode.MANIFEST_VALUE_INVALID, "/name"),
+                Arguments.of("empty image", minimalManifest("""
+                                services:
+                                  app:
+                                    image: ""
+                                """),
+                        ManifestProblemCode.MANIFEST_VALUE_INVALID, "/services/app/image"));
     }
 
     private static Arguments unsafeServiceField(

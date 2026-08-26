@@ -296,11 +296,21 @@ final class LabManifestValidator {
         Set<Integer> hostPorts = new HashSet<>();
         for (int index = 0; index < node.size(); index++) {
             String itemPath = path + "/" + index;
-            ObjectNode portNode = object(node.get(index), itemPath, problems);
-            if (portNode == null) {
+            JsonNode item = node.get(index);
+            if (!item.isObject()) {
+                problems.add(MANIFEST_PORT_POLICY_VIOLATION, itemPath,
+                        "Ports must use objects; host address strings are not supported.");
                 continue;
             }
-            checkAllowedFields(portNode, PORT_FIELDS, Set.of(), itemPath, problems);
+            ObjectNode portNode = item.asObject();
+            Set<String> hostAddressFields = Set.of("host_ip", "hostIp", "bind", "address");
+            for (String field : portNode.propertyNames()) {
+                if (hostAddressFields.contains(field)) {
+                    problems.add(MANIFEST_PORT_POLICY_VIOLATION, pointer(itemPath, field),
+                            "LabDeck fixes published port addresses to 127.0.0.1.");
+                }
+            }
+            checkAllowedFields(portNode, PORT_FIELDS, hostAddressFields, itemPath, problems);
             int container = requiredPort(portNode.get("container"), pointer(itemPath, "container"), problems);
             Optional<Integer> host = optionalHostPort(portNode.get("host"), pointer(itemPath, "host"), problems);
             String protocol = optionalText(
@@ -480,12 +490,12 @@ final class LabManifestValidator {
         if (node == null || node.isNull()) {
             return DEFAULT_MEMORY_BYTES;
         }
-        if (!node.isTextual()) {
+        if (!node.isString()) {
             problems.add(MANIFEST_RESOURCE_LIMIT_INVALID, path,
                     "Memory must use a value such as 512MiB or 1GB.");
             return DEFAULT_MEMORY_BYTES;
         }
-        Matcher matcher = MEMORY.matcher(node.textValue());
+        Matcher matcher = MEMORY.matcher(node.stringValue());
         if (!matcher.matches()) {
             problems.add(MANIFEST_RESOURCE_LIMIT_INVALID, path,
                     "Memory must use MB, GB, MiB, or GiB units.");
@@ -538,11 +548,11 @@ final class LabManifestValidator {
         if (node == null || node.isNull()) {
             return defaultValue;
         }
-        if (!node.isTextual()) {
+        if (!node.isString()) {
             problems.add(MANIFEST_VALUE_TYPE_INVALID, path, "A duration must use ms, s, or m units.");
             return defaultValue;
         }
-        Matcher matcher = DURATION.matcher(node.textValue());
+        Matcher matcher = DURATION.matcher(node.stringValue());
         if (!matcher.matches()) {
             problems.add(MANIFEST_VALUE_INVALID, path, "A duration must use ms, s, or m units.");
             return defaultValue;
@@ -625,7 +635,13 @@ final class LabManifestValidator {
             return "";
         }
         String value = text(node, path, maxLength, problems);
-        return value == null ? "" : value;
+        if (value == null) {
+            return "";
+        }
+        if (value.isEmpty()) {
+            problems.add(MANIFEST_VALUE_INVALID, path, "The value must not be empty.");
+        }
+        return value;
     }
 
     private static String optionalText(
@@ -638,11 +654,11 @@ final class LabManifestValidator {
     }
 
     private static String text(JsonNode node, String path, int maxLength, Problems problems) {
-        if (!node.isTextual()) {
+        if (!node.isString()) {
             problems.add(MANIFEST_VALUE_TYPE_INVALID, path, "The value must be a string.");
             return null;
         }
-        String value = node.textValue();
+        String value = node.stringValue();
         if (value.length() > maxLength) {
             problems.add(MANIFEST_VALUE_INVALID, path, "The string is too long.");
         }
@@ -682,7 +698,7 @@ final class LabManifestValidator {
     }
 
     private static void checkDockerSocketValues(JsonNode node, String path, Problems problems) {
-        if (node.isTextual() && isDockerSocket(node.textValue())) {
+        if (node.isString() && isDockerSocket(node.stringValue())) {
             problems.add(MANIFEST_DOCKER_SOCKET_FORBIDDEN, path.isEmpty() ? "/" : path,
                     "Docker Engine sockets and pipes cannot be used by a lab.");
             return;
@@ -725,7 +741,11 @@ final class LabManifestValidator {
                     "Build paths must be relative to the selected project.");
             return value;
         }
-        if (value.isBlank() || value.contains("//") || value.contains("%") || value.contains("$")
+        if (value.isBlank()
+                || value.startsWith("./")
+                || value.contains("//")
+                || value.contains("%")
+                || value.contains("$")
                 || value.contains("~") || value.contains(":")) {
             problems.add(MANIFEST_VALUE_INVALID, path, "The project-relative path is not valid.");
             return value;
@@ -770,8 +790,8 @@ final class LabManifestValidator {
     }
 
     private static void classifyUnsupportedVolume(JsonNode node, String path, Problems problems) {
-        if (node != null && node.isTextual()) {
-            String value = node.textValue();
+        if (node != null && node.isString()) {
+            String value = node.stringValue();
             if (isDockerSocket(value)) {
                 problems.add(MANIFEST_DOCKER_SOCKET_FORBIDDEN, path,
                         "Docker Engine sockets and pipes cannot be used by a lab.");
@@ -866,7 +886,8 @@ final class LabManifestValidator {
     }
 
     private static String pointer(String parent, String field) {
-        String escaped = field.replace("~", "~0").replace("/", "~1");
+        String safeField = field.matches("[A-Za-z0-9_-]{1,64}") ? field : "<invalid-field>";
+        String escaped = safeField.replace("~", "~0").replace("/", "~1");
         return (parent == null || parent.isEmpty() ? "" : parent) + "/" + escaped;
     }
 

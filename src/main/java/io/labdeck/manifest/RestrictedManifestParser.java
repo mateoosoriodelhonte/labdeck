@@ -6,6 +6,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.snakeyaml.engine.v2.api.LoadSettings;
+import tools.jackson.core.JacksonException;
 import tools.jackson.core.StreamReadConstraints;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
@@ -25,7 +26,7 @@ public final class RestrictedManifestParser {
                 .setAllowDuplicateKeys(false)
                 .setAllowRecursiveKeys(false)
                 .setAllowNonScalarKeys(false)
-                .setMaxAliasesForCollections(10)
+                .setMaxAliasesForCollections(0)
                 .setCodePointLimit(MAX_MANIFEST_BYTES)
                 .build();
         StreamReadConstraints constraints = StreamReadConstraints.builder()
@@ -73,7 +74,8 @@ public final class RestrictedManifestParser {
         if (yaml == null || yaml.isBlank()) {
             throw parseFailure("The manifest is required.");
         }
-        if (yaml.getBytes(StandardCharsets.UTF_8).length > MAX_MANIFEST_BYTES) {
+        if (yaml.length() > MAX_MANIFEST_BYTES
+                || yaml.getBytes(StandardCharsets.UTF_8).length > MAX_MANIFEST_BYTES) {
             throw parseFailure("The manifest exceeds the 256 KiB limit.");
         }
         if (containsDisallowedControlCharacter(yaml)) {
@@ -85,7 +87,7 @@ public final class RestrictedManifestParser {
             return validator.validate(root);
         } catch (ManifestValidationException exception) {
             throw exception;
-        } catch (RuntimeException exception) {
+        } catch (JacksonException exception) {
             throw parseFailure("The manifest is not well-formed YAML.");
         }
     }

@@ -48,6 +48,17 @@ public record LabManifest(
             healthcheck = healthcheck == null ? Optional.empty() : healthcheck;
             volumes = List.copyOf(volumes);
         }
+
+        @Override
+        public String toString() {
+            return "Service[source=" + source
+                    + ", workingDirectory=" + workingDirectory
+                    + ", command=" + command
+                    + ", environmentKeys=" + environment.navigableKeySet()
+                    + ", ports=" + ports
+                    + ", healthcheck=" + healthcheck
+                    + ", volumes=" + volumes + "]";
+        }
     }
 
     public sealed interface ServiceSource permits ImageSource, BuildSource {
