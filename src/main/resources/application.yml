@@ -1,6 +1,14 @@
 spring:
   application:
     name: labdeck
+  flyway:
+    baseline-on-migrate: false
+    clean-disabled: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+
+labdeck:
+  data-directory: ${LABDECK_DATA_DIR:${user.home}/.labdeck}
 
 server:
   address: 127.0.0.1
