@@ -1,0 +1,39 @@
+version: 1
+name: Database Assignment 4
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - container: 8000
+    healthcheck:
+      command: ["python", "-c", "print('ok')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  database:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: assignment
+      POSTGRES_USER: student
+    healthcheck:
+      command: ["pg_isready", "-U", "student"]
+    volumes:
+      - name: database-data
+        target: /var/lib/postgresql/data
+  cache:
+    image: redis:7
+    healthcheck:
+      command: ["redis-cli", "ping"]
+tests:
+  service: app
+  command: ["pytest", "-q"]
+  timeout: 5m
+resources:
+  memory: 1GB
+  cpus: 2

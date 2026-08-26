@@ -1,0 +1,30 @@
+version: 1
+name: Project build lab
+workspace:
+  mount: /workspace
+services:
+  app:
+    build:
+      context: containers/app
+      dockerfile: Containerfile
+    working_dir: /workspace/src
+    command: ["python", "main.py"]
+    environment:
+      LAB_MODE: development
+    ports:
+      - container: 8000
+        host: 18000
+        protocol: tcp
+    healthcheck:
+      command: ["python", "health.py"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 15s
+    volumes:
+      - name: course-cache
+        target: /data/cache
+        read_only: true
+resources:
+  memory: 512MiB
+  cpus: 0.5
