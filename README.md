@@ -16,6 +16,7 @@ less time fighting dependencies and more time working on the assignment.
 - Vue 3.5.41, Vite, and TypeScript interface with desktop and mobile layouts.
 - Versioned `GET /api/v1/system` status contract.
 - Closed v1 manifest schema, bounded YAML parser, semantic validator, and deterministic plan.
+- Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.
 - Unit, contract, build, and browser smoke checks for the bootstrap.
@@ -33,6 +34,9 @@ java -jar target/labdeck-0.1.0-SNAPSHOT.jar
 ```
 
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787).
+
+LabDeck stores its local database under `~/.labdeck` by default. Set `LABDECK_DATA_DIR` to use a
+different directory. Student project files stay in the workspace that the user selects.
 
 The Maven build downloads a project-local Node 24 runtime and uses `npm ci`. A normal LabDeck user
 does not need to start the frontend and backend separately.
@@ -84,7 +88,8 @@ resource controls, and persistent workspaces are the product.
 
 Architecture decisions are recorded in
 [ADR-0001](docs/decisions/0001-local-modular-monolith.md) and
-[ADR-0002](docs/decisions/0002-restricted-manifest.md).
+[ADR-0002](docs/decisions/0002-restricted-manifest.md), and
+[ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md).
 
 ## Safety and privacy
 
