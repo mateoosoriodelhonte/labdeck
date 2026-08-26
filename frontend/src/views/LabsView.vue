@@ -91,7 +91,7 @@ function statusLabel(status: LabStatus) {
     <p v-if="importNotice" class="notice" role="status">{{ importNotice }}</p>
 
     <div class="system-summary" aria-label="Local Docker summary">
-      <span><strong>Engine</strong> Docker 29.5.2</span>
+      <span><strong>Engine</strong> Connection check pending</span>
       <span><strong>Disk</strong> Calculating owned use</span>
       <span><strong>Privacy</strong> Local only</span>
     </div>

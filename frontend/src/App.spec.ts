@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import App from './App.vue'
 
 describe('App', () => {
-  it('shows the local Docker connection and primary navigation', () => {
+  it('shows the pending Docker check and primary navigation', () => {
     const wrapper = mount(App, {
       global: {
         stubs: {
@@ -14,7 +14,7 @@ describe('App', () => {
       },
     })
 
-    expect(wrapper.text()).toContain('Docker Engine connected')
+    expect(wrapper.text()).toContain('Docker check pending')
     expect(wrapper.text()).toContain('Docker Concepts')
     expect(wrapper.findAllComponents(RouterLinkStub)).toHaveLength(6)
   })

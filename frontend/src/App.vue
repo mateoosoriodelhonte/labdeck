@@ -39,18 +39,18 @@ function toggleTheme() {
       </nav>
 
       <div class="sidebar-engine">
-        <span class="status-dot status-dot--healthy" aria-hidden="true"></span>
+        <span class="status-dot status-dot--pending" aria-hidden="true"></span>
         <span>
           <strong>Local engine</strong>
-          <small>Connected</small>
+          <small>Connection check pending</small>
         </span>
       </div>
     </aside>
 
     <header class="topbar">
       <div class="engine-status" role="status">
-        <span class="status-dot status-dot--healthy" aria-hidden="true"></span>
-        <span>Docker Engine connected</span>
+        <span class="status-dot status-dot--pending" aria-hidden="true"></span>
+        <span>Docker check pending</span>
       </div>
       <button class="icon-button" type="button" :aria-label="themeLabel" @click="toggleTheme">
         <span aria-hidden="true">{{ theme === 'light' ? '☾' : '☀' }}</span>

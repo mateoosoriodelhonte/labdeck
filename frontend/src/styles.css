@@ -15,6 +15,7 @@
   --accent-soft: #eaf3ff;
   --healthy: #16843a;
   --healthy-soft: #e8f5eb;
+  --pending: #a76518;
   --stopped: #69727b;
   --focus: #0b6ee8;
   color: var(--text);
@@ -48,6 +49,7 @@
   --accent-soft: #173457;
   --healthy: #5dcc75;
   --healthy-soft: #173a23;
+  --pending: #e1ad5d;
   --stopped: #9aa4ad;
   --focus: #8fc2ff;
 }
@@ -278,6 +280,10 @@ code {
 
 .status-dot--healthy {
   background: var(--healthy);
+}
+
+.status-dot--pending {
+  background: var(--pending);
 }
 
 .icon-button {

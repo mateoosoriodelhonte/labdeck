@@ -55,6 +55,8 @@ npm run dev
 
 ## Architecture
 
+The v1 target architecture is:
+
 ```text
 Vue UI / CLI
       │
