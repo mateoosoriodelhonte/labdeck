@@ -28,6 +28,9 @@ public class SQLiteTestRunRepository implements TestRunRepository {
 
     @Override
     public void append(TestRunRecord testRun) {
+        if (!testRun.stdout().safeToPersist() || !testRun.stderr().safeToPersist()) {
+            throw new IllegalArgumentException("Test output must be scrubbed before persistence.");
+        }
         jdbc.update("""
                 INSERT INTO test_run (
                     id, lab_id, recorded_at_epoch_ms, status, duration_ms, exit_code,
@@ -84,8 +87,10 @@ public class SQLiteTestRunRepository implements TestRunRepository {
                 TestStatus.valueOf(results.getString("status")),
                 Duration.ofMillis(results.getLong("duration_ms")),
                 exitCode,
-                new StoredOutput(results.getString("stdout"), results.getInt("stdout_truncated") == 1),
-                new StoredOutput(results.getString("stderr"), results.getInt("stderr_truncated") == 1));
+                StoredOutput.fromPersistence(
+                        results.getString("stdout"), results.getInt("stdout_truncated") == 1),
+                StoredOutput.fromPersistence(
+                        results.getString("stderr"), results.getInt("stderr_truncated") == 1));
     }
 
     private static void requireId(String id, String label) {

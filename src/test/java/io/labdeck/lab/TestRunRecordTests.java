@@ -3,12 +3,17 @@ package io.labdeck.lab;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.OptionalInt;
 import org.junit.jupiter.api.Test;
 
 class TestRunRecordTests {
+
+    private static final TestOutputSanitizer SANITIZER =
+            TestOutputSanitizer.forLab(Path.of("/tmp/test-workspace"), List.of());
 
     @Test
     void boundsCombinedStandardOutputAndError() {
@@ -19,6 +24,7 @@ class TestRunRecordTests {
                 TestStatus.ERROR,
                 Duration.ofSeconds(2),
                 OptionalInt.empty(),
+                SANITIZER,
                 "student-output-secret",
                 "🙂".repeat(20_000));
 
@@ -41,8 +47,8 @@ class TestRunRecordTests {
 
     @Test
     void rejectsAnAggregateOutputThatBypassesTheBoundedFactory() {
-        StoredOutput first = new StoredOutput("a".repeat(40_000), false);
-        StoredOutput second = new StoredOutput("b".repeat(40_000), false);
+        StoredOutput first = StoredOutput.fromPersistence("a".repeat(40_000), false);
+        StoredOutput second = StoredOutput.fromPersistence("b".repeat(40_000), false);
 
         assertThatThrownBy(() -> new TestRunRecord(
                         "run-1",
@@ -57,6 +63,22 @@ class TestRunRecordTests {
                 .hasMessageContaining("combined");
     }
 
+    @Test
+    void rejectsATimestampOutsideTheSQLiteEpochMillisecondRange() {
+        assertThatThrownBy(() -> TestRunRecord.bounded(
+                        "run-1",
+                        "lab-1",
+                        Instant.MAX,
+                        TestStatus.ERROR,
+                        Duration.ZERO,
+                        OptionalInt.empty(),
+                        SANITIZER,
+                        "",
+                        ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("storage range");
+    }
+
     private static TestRunRecord result(TestStatus status, OptionalInt exitCode) {
         return TestRunRecord.bounded(
                 "run-1",
@@ -65,6 +87,7 @@ class TestRunRecordTests {
                 status,
                 Duration.ZERO,
                 exitCode,
+                SANITIZER,
                 "",
                 "");
     }

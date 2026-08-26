@@ -37,6 +37,22 @@ class LabRecordTests {
                 .doesNotContain("student-secret-workspace");
     }
 
+    @Test
+    void rejectsATimestampOutsideTheSQLiteEpochMillisecondRange() {
+        assertThatThrownBy(() -> new LabRecord(
+                        "lab-1",
+                        "project-1",
+                        "Database lab",
+                        1,
+                        Path.of("/tmp/workspace"),
+                        LabState.IMPORTED,
+                        0,
+                        Instant.MAX,
+                        Instant.MAX))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("storage range");
+    }
+
     private static LabRecord lab(LabState state) {
         return new LabRecord(
                 "lab-1",

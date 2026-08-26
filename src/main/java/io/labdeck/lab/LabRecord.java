@@ -43,6 +43,8 @@ public record LabRecord(
         if (createdAt.isBefore(Instant.EPOCH) || updatedAt.isBefore(createdAt)) {
             throw new IllegalArgumentException("The lab timestamps are not valid.");
         }
+        requireEpochMilliseconds(createdAt);
+        requireEpochMilliseconds(updatedAt);
     }
 
     public LabRecord transitionTo(LabState next, Instant transitionTime) {
@@ -67,5 +69,13 @@ public record LabRecord(
                 + ", revision=" + revision
                 + ", createdAt=" + createdAt
                 + ", updatedAt=" + updatedAt + "]";
+    }
+
+    private static void requireEpochMilliseconds(Instant value) {
+        try {
+            value.toEpochMilli();
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("The lab timestamp is outside the storage range.", exception);
+        }
     }
 }

@@ -1,14 +1,14 @@
 package io.labdeck.persistence.sqlite;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermission;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -119,6 +119,13 @@ public final class SQLiteDataSourceFactory {
         } catch (OverlappingFileLockException exception) {
             lockChannel.close();
             throw new IllegalStateException("Another LabDeck process is using this data directory.", exception);
+        } catch (IOException | RuntimeException exception) {
+            try {
+                lockChannel.close();
+            } catch (IOException closeException) {
+                exception.addSuppressed(closeException);
+            }
+            throw exception;
         }
     }
 

@@ -12,7 +12,7 @@ CREATE TABLE lab (
     updated_at_epoch_ms INTEGER NOT NULL CHECK (updated_at_epoch_ms >= created_at_epoch_ms)
 ) STRICT;
 
-CREATE INDEX lab_updated_at_idx ON lab(updated_at_epoch_ms DESC, id);
+CREATE INDEX lab_updated_at_idx ON lab(updated_at_epoch_ms DESC, id DESC);
 
 CREATE TABLE test_run (
     id TEXT PRIMARY KEY,
@@ -29,11 +29,11 @@ CREATE TABLE test_run (
     stderr_truncated INTEGER NOT NULL CHECK (stderr_truncated IN (0, 1)),
     CHECK (length(CAST(stdout AS BLOB)) + length(CAST(stderr AS BLOB)) <= 65536),
     CHECK (
-        (status = 'PASSED' AND exit_code = 0)
+        (status = 'PASSED' AND exit_code IS NOT NULL AND exit_code = 0)
         OR (status = 'FAILED' AND exit_code IS NOT NULL AND exit_code != 0)
         OR status IN ('ERROR', 'CANCELLED', 'TIMED_OUT')
     ),
     FOREIGN KEY (lab_id) REFERENCES lab(id) ON DELETE RESTRICT
 ) STRICT;
 
-CREATE INDEX test_run_lab_time_idx ON test_run(lab_id, recorded_at_epoch_ms DESC, id);
+CREATE INDEX test_run_lab_time_idx ON test_run(lab_id, recorded_at_epoch_ms DESC, id DESC);

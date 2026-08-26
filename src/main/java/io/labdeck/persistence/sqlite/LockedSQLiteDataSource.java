@@ -28,14 +28,26 @@ public final class LockedSQLiteDataSource extends HikariDataSource {
         } catch (RuntimeException exception) {
             closeFailure = exception;
         }
+        IOException lockFailure = null;
         try {
             lock.release();
+        } catch (IOException exception) {
+            lockFailure = exception;
+        }
+        try {
             lockChannel.close();
         } catch (IOException exception) {
-            if (closeFailure != null) {
-                exception.addSuppressed(closeFailure);
+            if (lockFailure == null) {
+                lockFailure = exception;
+            } else {
+                lockFailure.addSuppressed(exception);
             }
-            throw new IllegalStateException("LabDeck could not release its database lock.", exception);
+        }
+        if (lockFailure != null) {
+            if (closeFailure != null) {
+                lockFailure.addSuppressed(closeFailure);
+            }
+            throw new IllegalStateException("LabDeck could not release its database lock.", lockFailure);
         }
         if (closeFailure != null) {
             throw closeFailure;

@@ -27,6 +27,7 @@ public record TestRunRecord(
         if (recordedAt.isBefore(Instant.EPOCH)) {
             throw new IllegalArgumentException("The test timestamp is not valid.");
         }
+        requireEpochMilliseconds(recordedAt, "test timestamp");
         Objects.requireNonNull(status, "status");
         Objects.requireNonNull(duration, "duration");
         if (duration.isNegative() || duration.compareTo(MAX_DURATION) > 0) {
@@ -34,8 +35,8 @@ public record TestRunRecord(
         }
         exitCode = exitCode == null ? OptionalInt.empty() : exitCode;
         validateStatusAndExitCode(status, exitCode);
-        stdout = stdout == null ? StoredOutput.bounded("") : stdout;
-        stderr = stderr == null ? StoredOutput.bounded("") : stderr;
+        Objects.requireNonNull(stdout, "stdout");
+        Objects.requireNonNull(stderr, "stderr");
         if (stdout.utf8Bytes() + stderr.utf8Bytes() > StoredOutput.MAX_UTF8_BYTES) {
             throw new IllegalArgumentException("Stored test output exceeds the combined UTF-8 byte limit.");
         }
@@ -48,11 +49,20 @@ public record TestRunRecord(
             TestStatus status,
             Duration duration,
             OptionalInt exitCode,
+            TestOutputSanitizer sanitizer,
             String stdout,
             String stderr) {
-        StoredOutput boundedStdout = StoredOutput.bounded(stdout);
-        StoredOutput boundedStderr = StoredOutput.bounded(
-                stderr, StoredOutput.MAX_UTF8_BYTES - boundedStdout.utf8Bytes());
+        Objects.requireNonNull(sanitizer, "sanitizer");
+        int halfLimit = StoredOutput.MAX_UTF8_BYTES / 2;
+        StoredOutput boundedStdout = StoredOutput.bounded(stdout, halfLimit, sanitizer);
+        StoredOutput boundedStderr = StoredOutput.bounded(stderr, halfLimit, sanitizer);
+        if (!boundedStdout.truncated()) {
+            boundedStderr = StoredOutput.bounded(
+                    stderr, StoredOutput.MAX_UTF8_BYTES - boundedStdout.utf8Bytes(), sanitizer);
+        } else if (!boundedStderr.truncated()) {
+            boundedStdout = StoredOutput.bounded(
+                    stdout, StoredOutput.MAX_UTF8_BYTES - boundedStderr.utf8Bytes(), sanitizer);
+        }
         return new TestRunRecord(
                 id,
                 labId,
@@ -74,6 +84,14 @@ public record TestRunRecord(
         }
         if (status == TestStatus.FAILED && (exitCode.isEmpty() || exitCode.getAsInt() == 0)) {
             throw new IllegalArgumentException("A failed test must have a non-zero exit code.");
+        }
+    }
+
+    private static void requireEpochMilliseconds(Instant value, String label) {
+        try {
+            value.toEpochMilli();
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("The " + label + " is outside the storage range.", exception);
         }
     }
 

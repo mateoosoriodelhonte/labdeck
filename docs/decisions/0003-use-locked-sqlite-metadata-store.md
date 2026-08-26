@@ -37,8 +37,10 @@ changes so a stale operation cannot overwrite a newer result.
 
 Store test timestamp, status, duration, optional exit code, and separate standard output and error.
 The combined output limit is 65,536 UTF-8 bytes. Truncation cannot split a character. LabDeck does
-not scan student source files. A later test runner must remove known sensitive manifest values and
-workspace paths before it creates a persistence record.
+not scan student source files. The persistence adapter accepts only output made by the test-output
+sanitizer. The sanitizer removes the selected workspace path, known sensitive manifest values,
+common credential assignments, and bearer tokens before it applies the byte limit. A later test
+runner must give the sanitizer all known sensitive environment values.
 
 ## Alternatives considered
 
@@ -66,4 +68,5 @@ therefore use temporary file-backed databases and reopen the same file.
 - SQLite constraints reject orphan history, invalid states, and oversized output.
 - The selected workspace path is local metadata. Diagnostic text must redact it.
 - Arbitrary test output can contain text chosen by a test process. The test runner must scrub known
-  sensitive values, but no generic filter can prove that arbitrary output contains no secret.
+  sensitive values. Pattern scrubbing adds defense in depth, but no generic filter can prove that
+  arbitrary output contains no secret.

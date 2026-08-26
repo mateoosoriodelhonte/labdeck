@@ -7,6 +7,7 @@ import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabState;
 import io.labdeck.lab.StoredOutput;
 import io.labdeck.lab.TestRunRecord;
+import io.labdeck.lab.TestOutputSanitizer;
 import io.labdeck.lab.TestStatus;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileStore;
@@ -28,6 +29,8 @@ class SQLitePersistenceIntegrationTests {
 
     private static final Instant CREATED_AT = Instant.parse("2026-08-26T18:00:00Z");
     private static final Instant TESTED_AT = Instant.parse("2026-08-26T18:05:00Z");
+    private static final TestOutputSanitizer DEFAULT_SANITIZER =
+            TestOutputSanitizer.forLab(Path.of("/tmp/labdeck-test-workspace"), List.of());
     private static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = Set.of(
             PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE,
@@ -113,6 +116,22 @@ class SQLitePersistenceIntegrationTests {
             assertThatThrownBy(() -> insertRawTestRun(
                             jdbc, "bad-status", "lab-1", "OFFICIAL_GRADE", 0, "", ""))
                     .isInstanceOf(DataAccessException.class);
+            assertThatThrownBy(() -> insertRawTestRun(
+                            jdbc, "passed-without-exit", "lab-1", "PASSED", null, "", ""))
+                    .isInstanceOf(DataAccessException.class);
+
+            TestRunRecord restoredOutput = new TestRunRecord(
+                    "unsafe-restored",
+                    "lab-1",
+                    TESTED_AT,
+                    TestStatus.ERROR,
+                    Duration.ZERO,
+                    OptionalInt.empty(),
+                    StoredOutput.fromPersistence(credentialLikeText(), false),
+                    StoredOutput.fromPersistence("", false));
+            assertThatThrownBy(() -> new SQLiteTestRunRepository(dataSource).append(restoredOutput))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("scrubbed");
 
             new SQLiteTestRunRepository(dataSource).append(result(
                     "kept-history", TestStatus.PASSED, OptionalInt.of(0), "ok", ""));
@@ -133,7 +152,27 @@ class SQLitePersistenceIntegrationTests {
 
         try (LockedSQLiteDataSource dataSource = openAndMigrate(dataDirectory)) {
             new SQLiteLabRepository(dataSource).create(lab(workspace, "Privacy lab"));
+            TestOutputSanitizer sanitizer =
+                    TestOutputSanitizer.forLab(workspace, List.of(sourceSentinel, credentialSentinel));
+            TestRunRecord scrubbed = TestRunRecord.bounded(
+                    "privacy-run",
+                    "lab-1",
+                    TESTED_AT,
+                    TestStatus.ERROR,
+                    Duration.ZERO,
+                    OptionalInt.empty(),
+                    sanitizer,
+                    "printed " + sourceSentinel + " password=hunter2",
+                    "token=" + credentialSentinel + " path=" + workspace);
+            new SQLiteTestRunRepository(dataSource).append(scrubbed);
             JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+
+            assertThat(jdbc.queryForObject(
+                            "SELECT stdout || stderr FROM test_run WHERE id = ?",
+                            String.class,
+                            "privacy-run"))
+                    .contains(TestOutputSanitizer.REDACTION)
+                    .doesNotContain(sourceSentinel, credentialSentinel, "hunter2", workspace.toString());
 
             assertThat(columnNames(jdbc, "lab")).containsExactly(
                     "id",
@@ -238,8 +277,13 @@ class SQLitePersistenceIntegrationTests {
                 status,
                 Duration.ofSeconds(3),
                 exitCode,
+                DEFAULT_SANITIZER,
                 stdout,
                 stderr);
+    }
+
+    private static String credentialLikeText() {
+        return "password=must-not-persist";
     }
 
     private static void insertRawTestRun(
