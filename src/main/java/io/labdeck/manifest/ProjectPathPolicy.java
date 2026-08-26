@@ -15,6 +15,25 @@ public final class ProjectPathPolicy {
             "/boot", "/dev", "/etc", "/home", "/library", "/private", "/proc", "/root",
             "/run", "/system", "/sys", "/users", "/var", "c:/windows");
 
+    public ApprovedWorkspacePath resolveWorkspace(Path selectedWorkspace) {
+        if (selectedWorkspace == null) {
+            throw new IllegalArgumentException("The selected workspace is required.");
+        }
+        try {
+            ApprovedWorkspacePath workspace = ApprovedWorkspacePath.capture(selectedWorkspace);
+            if (isSensitiveWorkspaceRoot(workspace.path())) {
+                throw violation(ManifestProblemCode.MANIFEST_HOST_PATH_FORBIDDEN, "/workspace",
+                        "Select a project directory, not a home or system directory.");
+            }
+            return workspace;
+        } catch (ManifestValidationException exception) {
+            throw exception;
+        } catch (IOException | SecurityException exception) {
+            throw violation(ManifestProblemCode.MANIFEST_HOST_PATH_FORBIDDEN, "/workspace",
+                    "The selected project directory could not be approved safely.");
+        }
+    }
+
     public ResolvedBuildPaths resolveBuild(Path selectedWorkspace, String serviceId, BuildSource build) {
         if (selectedWorkspace == null || serviceId == null || build == null) {
             throw new IllegalArgumentException("Workspace, service ID, and build are required.");
@@ -22,11 +41,7 @@ public final class ProjectPathPolicy {
 
         String basePath = "/services/" + pointerSegment(serviceId) + "/build";
         try {
-            Path workspace = selectedWorkspace.toRealPath();
-            if (!Files.isDirectory(workspace) || isSensitiveWorkspaceRoot(workspace)) {
-                throw violation(ManifestProblemCode.MANIFEST_HOST_PATH_FORBIDDEN, "/workspace",
-                        "Select a project directory, not a home or system directory.");
-            }
+            Path workspace = resolveWorkspace(selectedWorkspace).path();
 
             Path contextCandidate = workspace.resolve(build.context()).normalize();
             requireContained(workspace, contextCandidate, basePath + "/context");

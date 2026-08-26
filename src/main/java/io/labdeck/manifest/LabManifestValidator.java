@@ -219,7 +219,8 @@ final class LabManifestValidator {
         List<Port> ports = parsePorts(node.get("ports"), pointer(path, "ports"), problems);
         Optional<HealthCheck> healthcheck = parseHealthCheck(
                 node.get("healthcheck"), pointer(path, "healthcheck"), problems);
-        List<VolumeMount> volumes = parseVolumes(node.get("volumes"), pointer(path, "volumes"), problems);
+        List<VolumeMount> volumes = parseVolumes(
+                node.get("volumes"), pointer(path, "volumes"), workspaceMount, problems);
         return new Service(source, workingDirectory, command, environment, ports, healthcheck, volumes);
     }
 
@@ -356,7 +357,8 @@ final class LabManifestValidator {
         return Optional.of(new HealthCheck(command, interval, timeout, retries, startPeriod));
     }
 
-    private static List<VolumeMount> parseVolumes(JsonNode node, String path, Problems problems) {
+    private static List<VolumeMount> parseVolumes(
+            JsonNode node, String path, String workspaceMount, Problems problems) {
         if (node == null || node.isNull()) {
             return List.of();
         }
@@ -393,6 +395,10 @@ final class LabManifestValidator {
             }
             String target = requiredText(volume.get("target"), pointer(itemPath, "target"), 256, problems);
             validateVolumeTarget(target, pointer(itemPath, "target"), problems);
+            if (pathsOverlap(target, workspaceMount)) {
+                problems.add(MANIFEST_SENSITIVE_MOUNT_FORBIDDEN, pointer(itemPath, "target"),
+                        "Named volumes cannot hide or overlap the approved workspace mount.");
+            }
             boolean readOnly = optionalBoolean(
                     volume.get("read_only"), pointer(itemPath, "read_only"), false, problems);
             if (!names.add(name)) {
@@ -787,6 +793,10 @@ final class LabManifestValidator {
                 return;
             }
         }
+    }
+
+    private static boolean pathsOverlap(String first, String second) {
+        return first.equals(second) || first.startsWith(second + "/") || second.startsWith(first + "/");
     }
 
     private static void classifyUnsupportedVolume(JsonNode node, String path, Problems problems) {
