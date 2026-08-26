@@ -1,0 +1,9 @@
+version: 1
+name: Root mount escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    volumes:
+      - /:/host

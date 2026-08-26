@@ -10,6 +10,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 class RestrictedManifestParserTests {
@@ -113,6 +114,24 @@ class RestrictedManifestParserTests {
                 """;
 
         assertSingleCode(yaml, ManifestProblemCode.MANIFEST_PARSE_ERROR);
+    }
+
+    @ParameterizedTest(name = "fixture {0}")
+    @CsvSource({
+        "privileged.yaml, MANIFEST_PRIVILEGED_FORBIDDEN",
+        "host-network.yaml, MANIFEST_HOST_NAMESPACE_FORBIDDEN",
+        "docker-socket.yaml, MANIFEST_DOCKER_SOCKET_FORBIDDEN",
+        "sensitive-mount.yaml, MANIFEST_SENSITIVE_MOUNT_FORBIDDEN",
+        "device.yaml, MANIFEST_DEVICE_FORBIDDEN",
+        "capability.yaml, MANIFEST_CAPABILITY_FORBIDDEN",
+        "escape-option.yaml, MANIFEST_ESCAPE_OPTION_FORBIDDEN",
+        "traversal.yaml, MANIFEST_TRAVERSAL_FORBIDDEN",
+        "host-path.yaml, MANIFEST_HOST_PATH_FORBIDDEN"
+    })
+    void rejectsEachFileBasedEscapeFixture(String filename, ManifestProblemCode expectedCode) throws IOException {
+        assertThatThrownBy(() -> parser.parse(fixture("manifests/invalid/" + filename)))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception ->
+                        assertThat(exception.problems()).extracting(ManifestProblem::code).contains(expectedCode));
     }
 
     @Test

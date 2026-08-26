@@ -1,0 +1,9 @@
+version: 1
+name: Capability escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    cap_add:
+      - SYS_ADMIN

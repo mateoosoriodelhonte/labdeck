@@ -1,0 +1,9 @@
+version: 1
+name: Device escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    devices:
+      - /dev/kvm:/dev/kvm

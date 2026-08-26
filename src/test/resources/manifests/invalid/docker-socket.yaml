@@ -1,0 +1,9 @@
+version: 1
+name: Docker socket escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    volumes:
+      - /var/run/docker.sock:/engine.sock

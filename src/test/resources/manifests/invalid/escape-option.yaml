@@ -1,0 +1,9 @@
+version: 1
+name: Runtime escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    security_opt:
+      - seccomp=unconfined

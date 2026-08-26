@@ -1,0 +1,8 @@
+version: 1
+name: Host path escape
+workspace:
+  mount: /workspace
+  host: /Users/student/course
+services:
+  app:
+    image: python:3.12

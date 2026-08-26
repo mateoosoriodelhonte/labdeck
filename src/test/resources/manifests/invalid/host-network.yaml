@@ -1,0 +1,8 @@
+version: 1
+name: Host network escape
+workspace:
+  mount: /workspace
+services:
+  app:
+    image: python:3.12
+    network_mode: host
