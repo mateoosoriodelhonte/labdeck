@@ -15,4 +15,3 @@ public class SystemController {
 
     public record SystemStatus(String name, String status, String access, String apiVersion) {}
 }
-
