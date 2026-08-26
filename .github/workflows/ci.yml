@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Source detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app-present: ${{ steps.detect.outputs.app-present }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect application source
+        id: detect
+        shell: bash
+        run: |
+          if [[ -f pom.xml && -f frontend/package-lock.json ]]; then
+            echo "app-present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "app-present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  frontend-quality:
+    name: Frontend quality
+    needs: source
+    if: needs.source.outputs.app-present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Test components
+        run: npm test
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  package:
+    name: Package application
+    needs: source
+    if: needs.source.outputs.app-present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Build executable JAR and run Java tests
+        run: ./mvnw --batch-mode --no-transfer-progress clean package
