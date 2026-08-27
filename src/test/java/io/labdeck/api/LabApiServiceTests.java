@@ -18,6 +18,9 @@ import io.labdeck.lab.LabState;
 import io.labdeck.lab.TestRunRepository;
 import io.labdeck.manifest.ManifestPlan;
 import io.labdeck.manifest.ManifestPlanCompiler;
+import io.labdeck.manifest.ManifestProblem;
+import io.labdeck.manifest.ManifestProblemCode;
+import io.labdeck.manifest.ManifestValidationException;
 import io.labdeck.manifest.ProjectPathPolicy;
 import io.labdeck.manifest.RestrictedManifestParser;
 import io.labdeck.manifest.WorkspaceManifestLoader;
@@ -125,6 +128,26 @@ class LabApiServiceTests {
         verify(lifecycle).start(lab, plan, CancellationToken.NONE);
         assertThat(response.lab().state()).isEqualTo("RUNNING");
         assertThat(response.lab().revision()).isEqualTo(2);
+    }
+
+    @Test
+    void stopReturnsTheNewStateEvenWhenTheManifestCannotBeReadAfterCleanup() {
+        LabRecord stopped = new LabRecord(
+                lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
+                LabState.STOPPED, 1, lab.createdAt(), NOW.plusSeconds(1));
+        when(lifecycle.stop(lab.id(), 0)).thenReturn(stopped);
+        when(manifests.load(lab.workspace())).thenThrow(new ManifestValidationException(List.of(
+                new ManifestProblem(
+                        ManifestProblemCode.MANIFEST_PARSE_ERROR,
+                        "/",
+                        "The manifest is not well-formed YAML."))));
+
+        var response = service.stopLab(lab.id(), 0);
+
+        verify(lifecycle).stop(lab.id(), 0);
+        assertThat(response.state()).isEqualTo("STOPPED");
+        assertThat(response.revision()).isEqualTo(1);
+        assertThat(response.plan()).isNull();
     }
 
     private static String manifest() {

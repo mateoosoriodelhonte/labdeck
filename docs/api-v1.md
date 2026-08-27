@@ -120,7 +120,9 @@ Request:
 The lifecycle checks this revision again while it holds the per-lab lock. A stale request returns
 `409` before any Docker resource changes. Stop uses only exact open journal records for that lab,
 then rechecks stored Engine identity and ownership labels. It never falls back to a broad Docker
-list or prune operation.
+list or prune operation. The response can contain `plan: null` when the manifest becomes unreadable.
+The stopped state and new revision still return, so a successful cleanup is not reported as a
+failed stop.
 
 ## Problem details
 

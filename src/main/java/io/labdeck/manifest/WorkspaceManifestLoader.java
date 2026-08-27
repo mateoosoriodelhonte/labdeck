@@ -42,14 +42,14 @@ public final class WorkspaceManifestLoader {
                         "The lab manifest cannot be a symbolic link.");
             }
             BasicFileAttributes before = attributes(manifest);
-            workspace.verifyUnchanged();
+            verifyWorkspace(workspace);
             byte[] input;
             try (InputStream stream = Files.newInputStream(
                     manifest, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
                 input = stream.readNBytes(RestrictedManifestParser.MAX_MANIFEST_BYTES + 1);
             }
             BasicFileAttributes after = attributes(manifest);
-            workspace.verifyUnchanged();
+            verifyWorkspace(workspace);
             if (!sameFile(before, after)) {
                 throw failure(
                         WorkspaceManifestException.Reason.CHANGED_DURING_READ,
@@ -84,6 +84,16 @@ public final class WorkspaceManifestLoader {
         return Objects.equals(before.fileKey(), after.fileKey())
                 && before.size() == after.size()
                 && before.lastModifiedTime().equals(after.lastModifiedTime());
+    }
+
+    private static void verifyWorkspace(ApprovedWorkspacePath workspace) {
+        try {
+            workspace.verifyUnchanged();
+        } catch (IllegalStateException exception) {
+            throw failure(
+                    WorkspaceManifestException.Reason.CHANGED_DURING_READ,
+                    "The selected workspace changed while LabDeck read its manifest. Retry the request.");
+        }
     }
 
     private static WorkspaceManifestException failure(

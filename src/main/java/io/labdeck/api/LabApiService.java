@@ -37,8 +37,10 @@ import io.labdeck.lab.TestRunRepository;
 import io.labdeck.manifest.LabManifest.BuildSource;
 import io.labdeck.manifest.LabManifest.ImageSource;
 import io.labdeck.manifest.ManifestPlan;
+import io.labdeck.manifest.ManifestValidationException;
 import io.labdeck.manifest.WorkspaceManifestLoader;
 import io.labdeck.manifest.WorkspaceManifestLoader.LoadedManifest;
+import io.labdeck.manifest.WorkspaceManifestException;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -201,7 +203,13 @@ public class LabApiService {
         LabRecord lab = findLab(id);
         requireRevision(lab, expectedRevision);
         LabRecord stopped = lifecycle.stop(id, expectedRevision);
-        return detail(stopped, loadPlan(stopped));
+        ManifestPlan plan;
+        try {
+            plan = loadPlan(stopped);
+        } catch (ManifestValidationException | WorkspaceManifestException exception) {
+            plan = null;
+        }
+        return detail(stopped, plan);
     }
 
     public ServiceListResponse listServices(String id) {
@@ -280,7 +288,7 @@ public class LabApiService {
                 lab.revision(),
                 lab.createdAt(),
                 lab.updatedAt(),
-                plan(plan),
+                plan == null ? null : plan(plan),
                 failure);
     }
 
