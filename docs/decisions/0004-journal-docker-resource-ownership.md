@@ -28,24 +28,29 @@ object.
 
 Before each Docker create call, write a resource reservation to SQLite. The reservation contains a
 random 128-bit ownership token, lab ID, project ID, resource type, logical name, and timestamps.
-Every created resource receives those values as static labels. After creation, inspect the resource
-and store the full Engine ID. A later start, stop, inspect, or removal must use that stored ID and
-must recheck every ownership label. A stale ID or mismatched label fails closed. It never falls back
-to a name or broad label search.
+Change the reservation from `RESERVED` to `DISPATCHED` before the create request can reach Docker.
+Every created resource receives the journal values as static labels. After creation, inspect the
+resource and store the full Engine ID. Docker volumes have reusable names instead of immutable IDs,
+so also store and recheck the Engine-assigned volume creation timestamp. A later start, stop,
+inspect, or removal must use that stored identity and must recheck every ownership label. A stale ID,
+replacement volume, or mismatched label fails closed. It never falls back to a broad label search.
 
-The one narrow recovery case is a create call with an ambiguous response. While the journal row is
-still reserved and has no Engine ID, LabDeck may search for the exact random token. It accepts one
-exact match, rejects more than one, and stores the returned ID. It does not retry the create blindly.
+The one narrow recovery case is a create call with an ambiguous response. Only a `DISPATCHED` row
+with no Engine ID may search for the exact random token and deterministic resource name. A
+`RESERVED` row is closed without discovery because no request was sent. A dispatched row accepts
+one exact match, rejects more than one, and stores the returned identity. One empty lookup does not
+prove that an ambiguous create failed. The row stays open and blocks reuse until a later exact
+reconciliation succeeds. LabDeck does not retry the create blindly.
 
 Use one internal, non-attachable bridge network per running lab. Pre-create every manifest volume
 with the local driver and ownership labels. Preserve named volumes during normal stop, cancellation,
 and failed-start cleanup. Never call a Docker prune endpoint. Never remove pulled images.
 
 Resolve the selected workspace to a real directory and record its filesystem identity. Recheck that
-identity immediately before every container create call. Use a structured bind mount with `rprivate`
-propagation. Reject a named-volume target that overlaps the workspace. Inspect each immutable image
-ID and reject a container create when an image-declared volume target lacks an explicit LabDeck
-mount.
+identity immediately before every container create call. Use a structured, non-recursive bind mount
+with `rprivate` propagation so an existing host submount is not imported into the lab. Reject a
+named-volume target that overlaps the workspace. Inspect each immutable image ID and reject a
+container create when an image-declared volume target lacks an explicit LabDeck mount.
 
 Container removal uses the stored ID with `force=false` and `removeVolumes=false`. Network removal
 fails when any endpoint remains attached. Normal stop removes journaled containers and the empty

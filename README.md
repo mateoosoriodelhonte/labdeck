@@ -19,7 +19,7 @@ less time fighting dependencies and more time working on the assignment.
 - Closed v1 manifest schema, bounded YAML parser, semantic validator, and deterministic plan.
 - Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
 - Public-image inspection and confirmed pulls without Docker registry credentials.
-- Journaled Docker containers, private networks, persistent volumes, and exact-ID cleanup.
+- Journaled Docker containers, private networks, persistent-volume identity, and exact cleanup.
 - Workspace identity checks before structured bind mounts; no general Docker prune operations.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.
