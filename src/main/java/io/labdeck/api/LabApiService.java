@@ -211,6 +211,11 @@ public class LabApiService {
             plan = loadPlan(stopped);
         } catch (ManifestValidationException | WorkspaceManifestException exception) {
             plan = null;
+        } catch (ApiException exception) {
+            if (!"WORKSPACE_CHANGED".equals(exception.code())) {
+                throw exception;
+            }
+            plan = null;
         }
         return detail(stopped, plan);
     }

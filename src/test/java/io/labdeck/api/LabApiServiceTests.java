@@ -161,6 +161,24 @@ class LabApiServiceTests {
     }
 
     @Test
+    void stopReturnsTheNewStateWhenTheWorkspaceIdentityChangedAfterCleanup() throws Exception {
+        LabRecord stopped = new LabRecord(
+                lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
+                LabState.STOPPED, 1, lab.createdAt(), NOW.plusSeconds(1));
+        Path replacement = Files.createDirectory(temporaryDirectory.resolve("replacement-workspace"));
+        when(lifecycle.stop(lab.id(), 0)).thenReturn(stopped);
+        when(manifests.load(lab.workspace())).thenReturn(new LoadedManifest(
+                new ProjectPathPolicy().resolveWorkspace(replacement), plan));
+
+        var response = service.stopLab(lab.id(), 0);
+
+        verify(lifecycle).stop(lab.id(), 0);
+        assertThat(response.state()).isEqualTo("STOPPED");
+        assertThat(response.revision()).isEqualTo(1);
+        assertThat(response.plan()).isNull();
+    }
+
+    @Test
     void serviceInspectionDoesNotDependOnTheMutableManifestOrExposeImageIds() {
         LabRecord running = new LabRecord(
                 lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
