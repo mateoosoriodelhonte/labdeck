@@ -1,6 +1,7 @@
 package io.labdeck.docker;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -43,6 +44,15 @@ public interface DockerEnginePort {
 
     DockerLogSubscription followContainerLogs(
             DockerResourceRecord active, int tail, Consumer<DockerLogLine> consumer);
+
+    default DockerTestExecutionResult executeContainerTest(
+            DockerResourceRecord active,
+            List<String> command,
+            String workingDirectory,
+            Duration timeout,
+            CancellationToken cancellation) {
+        throw new UnsupportedOperationException("Constrained Docker test execution is not available.");
+    }
 
     void startContainer(DockerResourceRecord active, DockerContainerSpec specification);
 

@@ -1,18 +1,22 @@
 package io.labdeck.api;
 
 import io.labdeck.api.LabApiModels.ImportLabRequest;
+import io.labdeck.api.LabApiModels.CancelTestRequest;
 import io.labdeck.api.LabApiModels.LabDetailResponse;
 import io.labdeck.api.LabApiModels.LabListResponse;
 import io.labdeck.api.LabApiModels.LabStartResponse;
 import io.labdeck.api.LabApiModels.LogListResponse;
 import io.labdeck.api.LabApiModels.ServiceListResponse;
+import io.labdeck.api.LabApiModels.RunTestsRequest;
 import io.labdeck.api.LabApiModels.StartLabRequest;
 import io.labdeck.api.LabApiModels.StopLabRequest;
 import io.labdeck.api.LabApiModels.TestHistoryResponse;
+import io.labdeck.api.LabApiModels.TestRunStatusResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.Pattern;
+import java.net.URI;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
@@ -99,9 +103,41 @@ public class LabController {
     }
 
     @GetMapping("/{id}/tests")
-    public TestHistoryResponse tests(
+    public ResponseEntity<TestHistoryResponse> tests(
             @PathVariable @Pattern(regexp = LAB_ID) String id,
             @RequestParam(defaultValue = "20") @Min(1) @Max(100) int limit) {
-        return labs.testHistory(id, limit);
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore())
+                .body(labs.testHistory(id, limit));
+    }
+
+    @PostMapping(path = "/{id}/tests", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<TestRunStatusResponse> runTest(
+            @PathVariable @Pattern(regexp = LAB_ID) String id,
+            @Valid @RequestBody RunTestsRequest request) {
+        TestRunStatusResponse run = labs.startTest(id, request);
+        return ResponseEntity.accepted()
+                .location(URI.create("/api/v1/labs/" + id + "/tests/" + run.id()))
+                .cacheControl(CacheControl.noStore())
+                .body(run);
+    }
+
+    @GetMapping("/{id}/tests/{runId}")
+    public ResponseEntity<TestRunStatusResponse> testStatus(
+            @PathVariable @Pattern(regexp = LAB_ID) String id,
+            @PathVariable @Pattern(regexp = LAB_ID) String runId) {
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore())
+                .body(labs.testStatus(id, runId));
+    }
+
+    @PostMapping(path = "/{id}/tests/{runId}/cancel", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<TestRunStatusResponse> cancelTest(
+            @PathVariable @Pattern(regexp = LAB_ID) String id,
+            @PathVariable @Pattern(regexp = LAB_ID) String runId,
+            @Valid @RequestBody CancelTestRequest request) {
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore())
+                .body(labs.cancelTest(id, runId));
     }
 }

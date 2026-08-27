@@ -141,6 +141,8 @@ class DockerJavaLabEngineIntegrationTests {
             assertThat(appliedLimits.getMemory()).isEqualTo(64L * 1024 * 1024);
             assertThat(appliedLimits.getMemorySwap()).isEqualTo(64L * 1024 * 1024);
             assertThat(appliedLimits.getNanoCPUs()).isEqualTo(250_000_000L);
+            assertThat(appliedLimits.getPidsLimit()).isEqualTo(256L);
+            assertThat(appliedLimits.getInit()).isTrue();
             assertThat(appliedLimits.getOomKillDisable()).isNotEqualTo(Boolean.TRUE);
             assertThat(docker.inspectNetworkCmd().withNetworkId(started.networkId()).exec().getInternal())
                     .isFalse();
@@ -423,6 +425,155 @@ class DockerJavaLabEngineIntegrationTests {
         }
     }
 
+    @Test
+    void executesOnlyLiteralManifestArgvAndReportsNaturalExitCodes() throws Exception {
+        String passingName = "Passing test Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(passingName)) {
+            ManifestPlan passing = compile("""
+                    version: 1
+                    name: Passing test Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        working_dir: /workspace
+                        command: ["sleep", "60"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    tests:
+                      service: app
+                      command: ["printf", "%s", "literal;whoami"]
+                      timeout: 5s
+                    """);
+            LabRecord running = scenario.lifecycle.start(
+                    scenario.lab, passing, CancellationToken.NONE).lab();
+
+            DockerLabTestResult result = scenario.lifecycle.executeTest(running, passing);
+
+            assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.COMPLETED);
+            assertThat(result.execution().exitCode()).hasValue(0);
+            assertThat(result.execution().stdout()).isEqualTo("literal;whoami");
+            assertThat(result.execution().stderr()).isEmpty();
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.RUNNING);
+        }
+
+        String failingName = "Failing test Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(failingName)) {
+            ManifestPlan failing = compile("""
+                    version: 1
+                    name: Failing test Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "60"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    tests:
+                      service: app
+                      command: ["false"]
+                      timeout: 5s
+                    """);
+            LabRecord running = scenario.lifecycle.start(
+                    scenario.lab, failing, CancellationToken.NONE).lab();
+
+            DockerLabTestResult result = scenario.lifecycle.executeTest(running, failing);
+
+            assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.COMPLETED);
+            assertThat(result.execution().exitCode()).hasValue(1);
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.RUNNING);
+        }
+    }
+
+    @Test
+    void timeoutStopsOnlyTheSelectedLabAndPreservesAForeignContainer() throws Exception {
+        String name = "Timed out test Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(name)) {
+            ManifestPlan timed = compile("""
+                    version: 1
+                    name: Timed out test Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "60"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    tests:
+                      service: app
+                      command: ["sleep", "30"]
+                      timeout: 1s
+                    """);
+            String sentinel = scenario.createForeignSentinel();
+            LabRecord running = scenario.lifecycle.start(
+                    scenario.lab, timed, CancellationToken.NONE).lab();
+
+            DockerLabTestResult result = scenario.lifecycle.executeTest(running, timed);
+
+            assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.TIMED_OUT);
+            assertThat(result.execution().exitCode()).isEmpty();
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.STOPPED);
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+            assertThat(scenario.docker.inspectContainerCmd(sentinel).exec().getState().getRunning())
+                    .isTrue();
+        }
+    }
+
+    @Test
+    void userCancellationStopsTheExactLabAndReturnsACancelledResult() throws Exception {
+        String name = "Cancelled test Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(name);
+                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            ManifestPlan cancellable = compile("""
+                    version: 1
+                    name: Cancelled test Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "60"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    tests:
+                      service: app
+                      command: ["sleep", "30"]
+                      timeout: 30s
+                    """);
+            LabRecord running = scenario.lifecycle.start(
+                    scenario.lab, cancellable, CancellationToken.NONE).lab();
+            Future<DockerLabTestResult> result = executor.submit(
+                    () -> scenario.lifecycle.executeTest(running, cancellable));
+
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            boolean cancellationAccepted = scenario.lifecycle.cancelTest(scenario.labId);
+            while (!cancellationAccepted && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+                cancellationAccepted = scenario.lifecycle.cancelTest(scenario.labId);
+            }
+
+            assertThat(cancellationAccepted).isTrue();
+            assertThat(result.get(15, TimeUnit.SECONDS)).satisfies(cancelled -> {
+                assertThat(cancelled.execution().state())
+                        .isEqualTo(DockerTestExecutionState.CANCELLED);
+                assertThat(cancelled.cancelCause()).contains(DockerTestCancelCause.USER_CANCELLED);
+            });
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.STOPPED);
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+        }
+    }
+
     private static ManifestPlan compile(String yaml) {
         return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
     }
@@ -481,6 +632,7 @@ class DockerJavaLabEngineIntegrationTests {
         private final SQLiteDockerResourceJournal journal;
         private final LabRecord lab;
         private final DockerLabLifecycle lifecycle;
+        private final List<String> foreignSentinels = new java.util.ArrayList<>();
 
         private DockerScenario(String name) throws Exception {
             run = UUID.randomUUID().toString().replace("-", "");
@@ -549,6 +701,19 @@ class DockerJavaLabEngineIntegrationTests {
             throw new IllegalStateException("The integration lab did not reach " + expected + " in time.");
         }
 
+        private String createForeignSentinel() {
+            String sentinel = docker.createContainerCmd(engine.inspectImage(IMAGE).orElseThrow().id())
+                    .withAuthConfig(new AuthConfig())
+                    .withName("labdeck-it-foreign-" + run.substring(0, 12))
+                    .withLabels(Map.of(RUN_LABEL, run))
+                    .withCmd("sleep", "120")
+                    .exec()
+                    .getId();
+            docker.startContainerCmd(sentinel).exec();
+            foreignSentinels.add(sentinel);
+            return sentinel;
+        }
+
         @Override
         public void close() throws Exception {
             try {
@@ -561,6 +726,9 @@ class DockerJavaLabEngineIntegrationTests {
                 cleanupJournaledResources(
                         engine, docker, journal, new LabOwnership(labId, projectId));
                 assertNoJournaledEngineResources(docker, labId, projectId);
+                foreignSentinels.forEach(sentinel -> cleanupSentinel(docker, sentinel, run));
+                assertThat(docker.listContainersCmd().withShowAll(true)
+                        .withLabelFilter(Map.of(RUN_LABEL, run)).exec()).isEmpty();
             } finally {
                 dataSource.close();
                 docker.close();

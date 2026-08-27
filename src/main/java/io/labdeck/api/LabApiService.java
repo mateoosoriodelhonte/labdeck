@@ -17,6 +17,7 @@ import io.labdeck.api.LabApiModels.ManifestPlanResponse;
 import io.labdeck.api.LabApiModels.PortMappingResponse;
 import io.labdeck.api.LabApiModels.PortPlanResponse;
 import io.labdeck.api.LabApiModels.ResourcePlanResponse;
+import io.labdeck.api.LabApiModels.RunTestsRequest;
 import io.labdeck.api.LabApiModels.ServiceListResponse;
 import io.labdeck.api.LabApiModels.ServiceMetricsResponse;
 import io.labdeck.api.LabApiModels.ServicePlanResponse;
@@ -28,6 +29,7 @@ import io.labdeck.api.LabApiModels.TemplateListResponse;
 import io.labdeck.api.LabApiModels.TestHistoryResponse;
 import io.labdeck.api.LabApiModels.TestPlanResponse;
 import io.labdeck.api.LabApiModels.TestRunResponse;
+import io.labdeck.api.LabApiModels.TestRunStatusResponse;
 import io.labdeck.api.LabApiModels.TopologyEdgeResponse;
 import io.labdeck.api.LabApiModels.TopologyNodeResponse;
 import io.labdeck.api.LabApiModels.TopologyResponse;
@@ -41,12 +43,15 @@ import io.labdeck.docker.DockerLogBatch;
 import io.labdeck.docker.DockerObservabilitySnapshot;
 import io.labdeck.docker.DockerServiceObservation;
 import io.labdeck.docker.DockerStartResult;
+import io.labdeck.lab.LabTestRunService;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
 import io.labdeck.lab.LabRuntimeFailure;
 import io.labdeck.lab.LabState;
 import io.labdeck.lab.TestRunRecord;
+import io.labdeck.lab.TestRunCoordinatorException;
 import io.labdeck.lab.TestRunRepository;
+import io.labdeck.lab.TestRunSnapshot;
 import io.labdeck.manifest.LabManifest.BuildSource;
 import io.labdeck.manifest.LabManifest.ImageSource;
 import io.labdeck.manifest.ManifestPlan;
@@ -83,6 +88,7 @@ public class LabApiService {
     private final TestRunRepository tests;
     private final WorkspaceManifestLoader manifests;
     private final DockerLabLifecycle lifecycle;
+    private final LabTestRunService testRuns;
     private final Clock clock;
     private final Supplier<String> identifier;
 
@@ -91,8 +97,16 @@ public class LabApiService {
             LabRepository labs,
             TestRunRepository tests,
             WorkspaceManifestLoader manifests,
-            DockerLabLifecycle lifecycle) {
-        this(labs, tests, manifests, lifecycle, Clock.systemUTC(), () -> UUID.randomUUID().toString());
+            DockerLabLifecycle lifecycle,
+            LabTestRunService testRuns) {
+        this(
+                labs,
+                tests,
+                manifests,
+                lifecycle,
+                testRuns,
+                Clock.systemUTC(),
+                () -> UUID.randomUUID().toString());
     }
 
     LabApiService(
@@ -100,12 +114,14 @@ public class LabApiService {
             TestRunRepository tests,
             WorkspaceManifestLoader manifests,
             DockerLabLifecycle lifecycle,
+            LabTestRunService testRuns,
             Clock clock,
             Supplier<String> identifier) {
         this.labs = Objects.requireNonNull(labs, "labs");
         this.tests = Objects.requireNonNull(tests, "tests");
         this.manifests = Objects.requireNonNull(manifests, "manifests");
         this.lifecycle = Objects.requireNonNull(lifecycle, "lifecycle");
+        this.testRuns = Objects.requireNonNull(testRuns, "testRuns");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.identifier = Objects.requireNonNull(identifier, "identifier");
     }
@@ -256,7 +272,45 @@ public class LabApiService {
         return new TestHistoryResponse(
                 API_VERSION,
                 lab.id(),
-                tests.findRecentByLab(lab.id(), limit).stream().map(LabApiService::testRun).toList());
+                tests.findRecentByLab(lab.id(), limit).stream().map(LabApiService::testRun).toList(),
+                testRuns.findActive(lab.id()).map(LabApiService::testRun).orElse(null));
+    }
+
+    public TestRunStatusResponse startTest(String id, RunTestsRequest request) {
+        Objects.requireNonNull(request, "request");
+        LabRecord lab = findLab(id);
+        requireRevision(lab, request.expectedRevision());
+        if (lab.state() != LabState.RUNNING) {
+            throw conflict(
+                    "LAB_NOT_RUNNING",
+                    "Lab is not running",
+                    "Start the lab before running its assignment test.",
+                    Map.of("currentState", lab.state().name()));
+        }
+        ManifestPlan plan = loadPlan(lab);
+        if (!plan.manifestSha256().equals(request.expectedManifestSha256())) {
+            throw conflict(
+                    "MANIFEST_CHANGED",
+                    "Manifest changed",
+                    "The manifest changed after the lab started. Restart the lab before running tests.",
+                    Map.of("currentManifestSha256", plan.manifestSha256()));
+        }
+        if (plan.tests().isEmpty()) {
+            throw new TestRunCoordinatorException(
+                    TestRunCoordinatorException.Reason.TEST_NOT_CONFIGURED);
+        }
+        lifecycle.validateTestStart(lab, plan);
+        return testRun(testRuns.start(lab, plan));
+    }
+
+    public TestRunStatusResponse testStatus(String labId, String runId) {
+        findLab(labId);
+        return testRun(testRuns.find(labId, runId));
+    }
+
+    public TestRunStatusResponse cancelTest(String labId, String runId) {
+        findLab(labId);
+        return testRun(testRuns.cancel(labId, runId));
     }
 
     public LogListResponse logs(String id, String service, int tail) {
@@ -287,7 +341,7 @@ public class LabApiService {
                 false,
                 "PLANNED",
                 "AVAILABLE",
-                "PLANNED");
+                "AVAILABLE");
     }
 
     private LabRecord findLab(String id) {
@@ -570,13 +624,40 @@ public class LabApiService {
     private static TestRunResponse testRun(TestRunRecord run) {
         return new TestRunResponse(
                 run.id(),
+                run.labRevision(),
+                run.service(),
+                run.testPlanSha256(),
                 run.recordedAt(),
                 run.status().name(),
+                run.outcomeReason().name(),
                 run.duration().toMillis(),
                 run.exitCode().isPresent() ? run.exitCode().getAsInt() : null,
                 run.stdout().text(),
                 run.stderr().text(),
-                run.outputTruncated());
+                run.stdout().truncated(),
+                run.stderr().truncated(),
+                false);
+    }
+
+    private static TestRunStatusResponse testRun(TestRunSnapshot run) {
+        return new TestRunStatusResponse(
+                API_VERSION,
+                run.id(),
+                run.labId(),
+                run.labRevision(),
+                run.service(),
+                run.testPlanSha256(),
+                run.startedAt(),
+                run.completedAt(),
+                run.status(),
+                run.outcomeReason(),
+                run.durationMillis(),
+                run.exitCode(),
+                run.stdout(),
+                run.stderr(),
+                run.stdoutTruncated(),
+                run.stderrTruncated(),
+                run.canCancel());
     }
 
     private static Path parseWorkspace(String workspace) {

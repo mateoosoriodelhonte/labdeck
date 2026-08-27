@@ -34,6 +34,14 @@ public final class LabApiModels {
 
     public record StopLabRequest(@NotNull @PositiveOrZero Long expectedRevision) {}
 
+    public record RunTestsRequest(
+            @NotNull @PositiveOrZero Long expectedRevision,
+            @NotBlank
+            @Pattern(regexp = "sha256:[a-f0-9]{64}")
+            String expectedManifestSha256) {}
+
+    public record CancelTestRequest() {}
+
     public record LabListResponse(String apiVersion, List<LabSummaryResponse> labs) {
         public LabListResponse {
             labs = List.copyOf(labs);
@@ -232,7 +240,8 @@ public final class LabApiModels {
     public record TestHistoryResponse(
             String apiVersion,
             String labId,
-            List<TestRunResponse> runs) {
+            List<TestRunResponse> runs,
+            TestRunStatusResponse activeRun) {
         public TestHistoryResponse {
             runs = List.copyOf(runs);
         }
@@ -240,13 +249,38 @@ public final class LabApiModels {
 
     public record TestRunResponse(
             String id,
+            long labRevision,
+            String service,
+            String testPlanSha256,
             Instant recordedAt,
             String status,
+            String outcomeReason,
             long durationMillis,
             Integer exitCode,
             String stdout,
             String stderr,
-            boolean outputTruncated) {}
+            boolean stdoutTruncated,
+            boolean stderrTruncated,
+            boolean canCancel) {}
+
+    public record TestRunStatusResponse(
+            String apiVersion,
+            String id,
+            String labId,
+            long labRevision,
+            String service,
+            String testPlanSha256,
+            Instant startedAt,
+            Instant completedAt,
+            String status,
+            String outcomeReason,
+            long durationMillis,
+            Integer exitCode,
+            String stdout,
+            String stderr,
+            boolean stdoutTruncated,
+            boolean stderrTruncated,
+            boolean canCancel) {}
 
     public record LogListResponse(
             String apiVersion,

@@ -20,6 +20,8 @@ import io.labdeck.api.LabApiModels.ManifestPlanResponse;
 import io.labdeck.api.LabApiModels.ResourcePlanResponse;
 import io.labdeck.api.LabApiModels.SettingsResponse;
 import io.labdeck.api.LabApiModels.TemplateListResponse;
+import io.labdeck.api.LabApiModels.TestHistoryResponse;
+import io.labdeck.api.LabApiModels.TestRunStatusResponse;
 import io.labdeck.docker.DockerEngineCapabilityException;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -276,6 +278,85 @@ class LabControllerContractTests {
                 .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
     }
 
+    @Test
+    void assignmentTestsUseOnlyTheReviewedManifestPlanAndReturnNoStoreStatus() throws Exception {
+        TestRunStatusResponse running = testRun("RUNNING", null, true);
+        TestRunStatusResponse cancelling = testRun("CANCELLING", null, false);
+        when(labs.testHistory("lab-1", 20))
+                .thenReturn(new TestHistoryResponse("v1", "lab-1", List.of(), running));
+        when(labs.startTest("lab-1", new LabApiModels.RunTestsRequest(
+                2L,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")))
+                .thenReturn(running);
+        when(labs.testStatus("lab-1", "test-1")).thenReturn(running);
+        when(labs.cancelTest("lab-1", "test-1")).thenReturn(cancelling);
+
+        mvc.perform(post("/api/v1/labs/lab-1/tests")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "expectedRevision": 2,
+                                  "expectedManifestSha256":
+                                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                }
+                                """))
+                .andExpect(status().isForbidden());
+
+        CsrfSession csrf = csrf();
+        mvc.perform(post("/api/v1/labs/lab-1/tests")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "expectedRevision": 2,
+                                  "expectedManifestSha256":
+                                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                  "command": ["sh", "-c", "untrusted"]
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("MALFORMED_JSON"));
+
+        mvc.perform(post("/api/v1/labs/lab-1/tests")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "expectedRevision": 2,
+                                  "expectedManifestSha256":
+                                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                }
+                                """))
+                .andExpect(status().isAccepted())
+                .andExpect(header().string(HttpHeaders.LOCATION, "/api/v1/labs/lab-1/tests/test-1"))
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.status").value("RUNNING"))
+                .andExpect(jsonPath("$.canCancel").value(true));
+
+        mvc.perform(get("/api/v1/labs/lab-1/tests/test-1"))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.testPlanSha256").value(
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+
+        mvc.perform(get("/api/v1/labs/lab-1/tests"))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.activeRun.id").value("test-1"))
+                .andExpect(jsonPath("$.activeRun.canCancel").value(true));
+
+        mvc.perform(post("/api/v1/labs/lab-1/tests/test-1/cancel")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.status").value("CANCELLING"));
+    }
+
     private void assertMalformed(CsrfSession csrf, String body) throws Exception {
         mvc.perform(post("/api/v1/labs")
                         .session(csrf.session())
@@ -310,6 +391,28 @@ class LabControllerContractTests {
         return new LabDetailResponse(
                 "v1", "lab-1", "API fixture", "/tmp/api-fixture", "IMPORTED", 0,
                 NOW, NOW, plan, null);
+    }
+
+    private static TestRunStatusResponse testRun(
+            String status, String outcomeReason, boolean canCancel) {
+        return new TestRunStatusResponse(
+                "v1",
+                "test-1",
+                "lab-1",
+                2,
+                "app",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                NOW,
+                null,
+                status,
+                outcomeReason,
+                5,
+                null,
+                "",
+                "",
+                false,
+                false,
+                canCancel);
     }
 
     private record CsrfSession(MockHttpSession session, String header, String token) {}

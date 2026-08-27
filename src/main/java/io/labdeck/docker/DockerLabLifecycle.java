@@ -61,7 +61,10 @@ public class DockerLabLifecycle implements AutoCloseable {
     private final DockerRuntimeMonitorPort runtimeMonitor;
     private final ConcurrentHashMap<String, ReentrantLock> labLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ActiveStart> activeStarts = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Integer> stopRequests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ActiveTest> activeTests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> runningManifestHashes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Integer>> stopRequests =
+            new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<TrackedLogSubscription>> logSubscriptions =
             new ConcurrentHashMap<>();
     private final ExecutorService observationExecutor = newObservationExecutor();
@@ -194,11 +197,11 @@ public class DockerLabLifecycle implements AutoCloseable {
         }
         cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
         Map<String, ServiceDockerPolicy> policies = compileDockerPolicies(plan);
-        ActiveStart operation = new ActiveStart(cancellation);
+        ActiveStart operation = new ActiveStart(requestedLab.revision(), cancellation);
         if (activeStarts.putIfAbsent(requestedLab.id(), operation) != null) {
             throw new IllegalStateException("Another start operation is already active for this lab.");
         }
-        if (stopRequests.containsKey(requestedLab.id())) {
+        if (hasStopRequest(requestedLab.id(), requestedLab.revision())) {
             operation.cancel();
         }
         ReentrantLock lock = lockFor(requestedLab.id());
@@ -230,6 +233,7 @@ public class DockerLabLifecycle implements AutoCloseable {
 
             Instant transitionTime = now();
             LabRecord starting = current.transitionTo(LabState.STARTING, transitionTime);
+            operation.advanceRevision(starting.revision());
             if (!labs.compareAndSetState(
                     current.id(), current.revision(), current.state(), LabState.STARTING, transitionTime)) {
                 throw new IllegalStateException("Another lab operation won the startup race.");
@@ -305,6 +309,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                     throw new IllegalStateException("The ready lab state could not be stored.");
                 }
                 committedRun = running;
+                runningManifestHashes.put(running.id(), plan.manifestSha256());
                 runtimeMonitor.watch(
                         running.id(),
                         running.revision(),
@@ -351,25 +356,43 @@ public class DockerLabLifecycle implements AutoCloseable {
         if (labId == null || labId.isBlank()) {
             throw new IllegalArgumentException("The lab ID is required.");
         }
-        registerStopRequest(labId);
+        if (expectedRevision != null) {
+            LabRecord observed = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            if (observed.revision() != expectedRevision.longValue()) {
+                throw new IllegalStateException("The lab changed before the stop operation began.");
+            }
+        }
+        registerStopRequest(labId, expectedRevision);
         try {
             ActiveStart active = activeStarts.get(labId);
-            if (active != null) {
+            boolean cancelledMatchingStart = active != null && active.matches(expectedRevision);
+            if (cancelledMatchingStart) {
                 active.cancel();
             }
-            runtimeMonitor.cancel(labId);
+            if (expectedRevision == null) {
+                runtimeMonitor.cancel(labId);
+            }
             ReentrantLock lock = lockFor(labId);
             lock.lock();
             try {
-                cancelLogSubscriptions(labId);
                 LabRecord current = labs.findById(labId)
                         .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
                 if (expectedRevision != null && current.revision() != expectedRevision.longValue()) {
+                    if (cancelledMatchingStart && current.state() == LabState.STOPPED) {
+                        return current;
+                    }
                     throw new IllegalStateException("The lab changed before the stop operation began.");
                 }
+                if (expectedRevision != null) {
+                    runtimeMonitor.cancel(labId);
+                }
+                cancelActiveTest(labId, DockerTestCancelCause.LAB_STOPPED);
+                cancelLogSubscriptions(labId);
                 LabState cleanupState = current.state();
                 LabRecord stopping = current;
                 if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
+                    runningManifestHashes.remove(labId);
                     Instant transitionTime = now();
                     stopping = current.transitionTo(LabState.STOPPING, transitionTime);
                     if (!labs.compareAndSetState(
@@ -378,6 +401,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                     }
                     cleanupState = LabState.STOPPING;
                 } else if (current.state() == LabState.IMPORTED) {
+                    runningManifestHashes.remove(labId);
                     Instant transitionTime = now();
                     LabRecord stopped = current.transitionTo(LabState.STOPPED, transitionTime);
                     if (!labs.compareAndSetState(
@@ -386,6 +410,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                     }
                     return stopped;
                 } else if (current.state() == LabState.STOPPED) {
+                    runningManifestHashes.remove(labId);
                     return current;
                 } else {
                     throw new IllegalStateException("The lab cannot stop from its current state.");
@@ -415,7 +440,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                 unlock(lock);
             }
         } finally {
-            clearStopRequest(labId);
+            clearStopRequest(labId, expectedRevision);
         }
     }
 
@@ -598,6 +623,205 @@ public class DockerLabLifecycle implements AutoCloseable {
         } finally {
             unlock(lock);
         }
+    }
+
+    public DockerLabTestResult executeTest(LabRecord requestedLab, ManifestPlan plan) {
+        return executeTest(requestedLab, plan, CancellationToken.NONE);
+    }
+
+    public void validateTestStart(LabRecord requestedLab, ManifestPlan plan) {
+        Objects.requireNonNull(requestedLab, "requestedLab");
+        requirePlan(plan);
+        if (plan.tests().isEmpty()) {
+            throw new IllegalArgumentException("The manifest does not define an assignment test.");
+        }
+        ReentrantLock lock = lockFor(requestedLab.id());
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(requestedLab.id())
+                    .orElseThrow(() -> new DockerTestStartException(
+                            DockerTestStartException.Reason.LAB_CHANGED));
+            if (current.revision() != requestedLab.revision()
+                    || !current.projectId().equals(requestedLab.projectId())) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.LAB_CHANGED);
+            }
+            if (current.state() != LabState.RUNNING
+                    || hasStopRequest(current.id(), current.revision())) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.LAB_NOT_RUNNING);
+            }
+            if (!plan.manifestSha256().equals(runningManifestHashes.get(current.id()))) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.RESTART_REQUIRED);
+            }
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    public DockerLabTestResult executeTest(
+            LabRecord requestedLab, ManifestPlan plan, CancellationToken externalCancellation) {
+        Objects.requireNonNull(requestedLab, "requestedLab");
+        externalCancellation = externalCancellation == null
+                ? CancellationToken.NONE : externalCancellation;
+        requirePlan(plan);
+        var test = plan.tests().orElseThrow(() -> new IllegalArgumentException(
+                "The manifest does not define an assignment test."));
+        ServicePlan service = plan.services().stream()
+                .filter(candidate -> candidate.id().equals(test.service()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "The manifest test service is not defined."));
+        ActiveTest operation = new ActiveTest(externalCancellation);
+        if (activeTests.putIfAbsent(requestedLab.id(), operation) != null) {
+            throw new DockerTestStartException(DockerTestStartException.Reason.ALREADY_RUNNING);
+        }
+
+        DockerResourceRecord container;
+        ReentrantLock lock = lockFor(requestedLab.id());
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(requestedLab.id())
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            if (current.revision() != requestedLab.revision()
+                    || !current.projectId().equals(requestedLab.projectId())) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.LAB_CHANGED);
+            }
+            if (current.state() != LabState.RUNNING
+                    || hasStopRequest(current.id(), current.revision())) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.LAB_NOT_RUNNING);
+            }
+            if (!plan.manifestSha256().equals(runningManifestHashes.get(current.id()))) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.RESTART_REQUIRED);
+            }
+            LabOwnership ownership = new LabOwnership(current.id(), current.projectId());
+            container = journal.findOpen(
+                            ownership, DockerResourceType.CONTAINER, test.service())
+                    .filter(resource -> resource.state() == DockerResourceState.ACTIVE)
+                    .orElseThrow(DockerActiveServiceNotFoundException::new);
+        } catch (RuntimeException failure) {
+            activeTests.remove(requestedLab.id(), operation);
+            throw failure;
+        } finally {
+            unlock(lock);
+        }
+
+        try {
+            DockerTestExecutionResult execution;
+            try {
+                engine.verifyAvailable();
+                execution = engine.executeContainerTest(
+                        container,
+                        test.command(),
+                        service.definition().workingDirectory(),
+                        test.timeout(),
+                        operation);
+            } catch (DockerOperationCancelledException failure) {
+                execution = emptyTestResult(DockerTestExecutionState.CANCELLED);
+            } catch (DockerOwnershipException failure) {
+                execution = emptyTestResult(DockerTestExecutionState.ERROR);
+            }
+            if (execution.state() == DockerTestExecutionState.COMPLETED
+                    && !operation.completeNaturally()) {
+                execution = incompleteResult(DockerTestExecutionState.CANCELLED, execution);
+            } else if (execution.state() == DockerTestExecutionState.TIMED_OUT
+                    && !operation.completeDeadline()) {
+                execution = incompleteResult(DockerTestExecutionState.CANCELLED, execution);
+            } else if (execution.state() == DockerTestExecutionState.CANCELLED) {
+                operation.completeCancellation();
+            } else if (execution.state() == DockerTestExecutionState.ERROR
+                    && !operation.completeFailure()) {
+                execution = incompleteResult(DockerTestExecutionState.CANCELLED, execution);
+            }
+
+            if (execution.state() == DockerTestExecutionState.CANCELLED
+                    || execution.state() == DockerTestExecutionState.TIMED_OUT
+                    || execution.state() == DockerTestExecutionState.ERROR) {
+                terminateLabAfterTest(requestedLab);
+            }
+            if (execution.state() == DockerTestExecutionState.COMPLETED) {
+                requireTestContextUnchanged(requestedLab, plan);
+            }
+            Optional<DockerTestCancelCause> cause = execution.state() == DockerTestExecutionState.CANCELLED
+                    ? Optional.of(operation.cancelCause())
+                    : Optional.empty();
+            return new DockerLabTestResult(execution, cause);
+        } finally {
+            activeTests.remove(requestedLab.id(), operation);
+        }
+    }
+
+    public boolean cancelTest(String labId) {
+        if (labId == null || !labId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+            throw new IllegalArgumentException("The lab ID is not valid.");
+        }
+        return cancelActiveTest(labId, DockerTestCancelCause.USER_CANCELLED);
+    }
+
+    private void requireTestContextUnchanged(LabRecord requestedLab, ManifestPlan plan) {
+        ReentrantLock lock = lockFor(requestedLab.id());
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(requestedLab.id())
+                    .orElseThrow(() -> new DockerTestStartException(
+                            DockerTestStartException.Reason.LAB_CHANGED));
+            if (current.state() != LabState.RUNNING
+                    || current.revision() != requestedLab.revision()
+                    || !current.projectId().equals(requestedLab.projectId())
+                    || !plan.manifestSha256().equals(runningManifestHashes.get(current.id()))) {
+                throw new DockerTestStartException(DockerTestStartException.Reason.LAB_CHANGED);
+            }
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    private void terminateLabAfterTest(LabRecord requestedLab) {
+        try {
+            stop(requestedLab.id(), requestedLab.revision());
+            return;
+        } catch (RuntimeException failure) {
+            ReentrantLock lock = lockFor(requestedLab.id());
+            lock.lock();
+            try {
+                LabRecord current = labs.findById(requestedLab.id()).orElse(null);
+                if (current != null
+                        && current.state() == LabState.STOPPED
+                        && journal.findOpenByLab(new LabOwnership(
+                                        current.id(), current.projectId())).stream()
+                                .noneMatch(resource -> resource.type() == DockerResourceType.CONTAINER
+                                        && resource.state() == DockerResourceState.ACTIVE)) {
+                    return;
+                }
+            } finally {
+                unlock(lock);
+            }
+            throw new DockerTestTerminationException();
+        }
+    }
+
+    private boolean cancelActiveTest(String labId, DockerTestCancelCause cause) {
+        ActiveTest active = activeTests.get(labId);
+        return active != null && active.cancel(cause);
+    }
+
+    private static DockerTestExecutionResult incompleteResult(
+            DockerTestExecutionState state, DockerTestExecutionResult source) {
+        return new DockerTestExecutionResult(
+                state,
+                java.util.OptionalInt.empty(),
+                source.stdout(),
+                source.stderr(),
+                source.stdoutTruncated(),
+                source.stderrTruncated());
+    }
+
+    private static DockerTestExecutionResult emptyTestResult(DockerTestExecutionState state) {
+        return new DockerTestExecutionResult(
+                state,
+                java.util.OptionalInt.empty(),
+                "",
+                "",
+                false,
+                false);
     }
 
     private ActiveLogTarget resolveActiveContainer(String labId, String service) {
@@ -845,6 +1069,7 @@ public class DockerLabLifecycle implements AutoCloseable {
             LabRecord running,
             LabOwnership ownership,
             DockerOperationCancelledException cancellationFailure) {
+        runningManifestHashes.remove(running.id());
         runtimeMonitor.cancel(running.id());
         Instant stoppingAt = now();
         LabRecord stopping = running.transitionTo(LabState.STOPPING, stoppingAt);
@@ -903,6 +1128,7 @@ public class DockerLabLifecycle implements AutoCloseable {
 
     private void finishFailedCommittedRun(
             LabRecord running, LabOwnership ownership, RuntimeException failure) {
+        runningManifestHashes.remove(running.id());
         runtimeMonitor.cancel(running.id());
         Instant stoppingAt = now();
         LabRecord stopping = running.transitionTo(LabState.STOPPING, stoppingAt);
@@ -944,6 +1170,8 @@ public class DockerLabLifecycle implements AutoCloseable {
                     || !current.projectId().equals(monitoredRun.projectId())) {
                 return;
             }
+            cancelActiveTest(monitoredRun.id(), DockerTestCancelCause.LAB_STOPPED);
+            runningManifestHashes.remove(monitoredRun.id());
             Instant stoppingAt = now();
             LabRecord stopping = current.transitionTo(LabState.STOPPING, stoppingAt);
             if (!labs.compareAndSetState(
@@ -983,6 +1211,16 @@ public class DockerLabLifecycle implements AutoCloseable {
 
     @Override
     public void close() {
+        List<String> testingLabs = List.copyOf(activeTests.keySet());
+        testingLabs.forEach(labId ->
+                cancelActiveTest(labId, DockerTestCancelCause.APPLICATION_SHUTDOWN));
+        for (String labId : testingLabs) {
+            try {
+                stop(labId);
+            } catch (RuntimeException ignored) {
+                // The active result is marked unavailable if exact cleanup cannot be proved.
+            }
+        }
         List.copyOf(logSubscriptions.keySet()).forEach(this::cancelLogSubscriptions);
         observationExecutor.shutdownNow();
         runtimeMonitor.close();
@@ -1233,12 +1471,25 @@ public class DockerLabLifecycle implements AutoCloseable {
         return labLocks.computeIfAbsent(labId, ignored -> new ReentrantLock());
     }
 
-    private void registerStopRequest(String labId) {
-        stopRequests.merge(labId, 1, (current, added) -> Math.addExact(current, added));
+    private void registerStopRequest(String labId, Long expectedRevision) {
+        long revisionKey = expectedRevision == null ? -1L : expectedRevision;
+        stopRequests.computeIfAbsent(labId, ignored -> new ConcurrentHashMap<>())
+                .merge(revisionKey, 1, (current, added) -> Math.addExact(current, added));
     }
 
-    private void clearStopRequest(String labId) {
-        stopRequests.computeIfPresent(labId, (ignored, count) -> count == 1 ? null : count - 1);
+    private void clearStopRequest(String labId, Long expectedRevision) {
+        long revisionKey = expectedRevision == null ? -1L : expectedRevision;
+        stopRequests.computeIfPresent(labId, (ignored, byRevision) -> {
+            byRevision.computeIfPresent(
+                    revisionKey, (ignoredRevision, count) -> count == 1 ? null : count - 1);
+            return byRevision.isEmpty() ? null : byRevision;
+        });
+    }
+
+    private boolean hasStopRequest(String labId, long revision) {
+        var byRevision = stopRequests.get(labId);
+        return byRevision != null
+                && (byRevision.containsKey(-1L) || byRevision.containsKey(revision));
     }
 
     private void unlock(ReentrantLock lock) {
@@ -1283,10 +1534,14 @@ public class DockerLabLifecycle implements AutoCloseable {
     }
 
     private static final class ActiveStart implements CancellationToken {
+        private final long requestedRevision;
+        private final java.util.concurrent.atomic.AtomicLong currentRevision;
         private final CancellationToken external;
         private final AtomicBoolean stopRequested = new AtomicBoolean();
 
-        private ActiveStart(CancellationToken external) {
+        private ActiveStart(long requestedRevision, CancellationToken external) {
+            this.requestedRevision = requestedRevision;
+            this.currentRevision = new java.util.concurrent.atomic.AtomicLong(requestedRevision);
             this.external = Objects.requireNonNull(external, "external");
         }
 
@@ -1302,6 +1557,83 @@ public class DockerLabLifecycle implements AutoCloseable {
 
         private synchronized void cancel() {
             stopRequested.set(true);
+        }
+
+        private boolean matches(Long expectedRevision) {
+            return expectedRevision == null
+                    || requestedRevision == expectedRevision.longValue()
+                    || currentRevision.get() == expectedRevision.longValue();
+        }
+
+        private void advanceRevision(long revision) {
+            currentRevision.set(revision);
+        }
+    }
+
+    private static final class ActiveTest implements CancellationToken {
+        private final CancellationToken external;
+        private DockerTestCancelCause cancelCause;
+        private boolean terminal;
+
+        private ActiveTest(CancellationToken external) {
+            this.external = Objects.requireNonNull(external, "external");
+        }
+
+        @Override
+        public synchronized boolean isCancellationRequested() {
+            return cancelCause != null || external.isCancellationRequested();
+        }
+
+        private synchronized boolean cancel(DockerTestCancelCause cause) {
+            Objects.requireNonNull(cause, "cause");
+            if (terminal || cancelCause != null) {
+                return false;
+            }
+            cancelCause = cause;
+            return true;
+        }
+
+        private synchronized boolean completeNaturally() {
+            return completeIfNotCancelled();
+        }
+
+        private synchronized boolean completeDeadline() {
+            return completeIfNotCancelled();
+        }
+
+        private synchronized boolean completeFailure() {
+            return completeIfNotCancelled();
+        }
+
+        private synchronized void completeCancellation() {
+            if (cancelCause == null) {
+                cancelCause = external.isCancellationRequested()
+                        ? DockerTestCancelCause.USER_CANCELLED
+                        : DockerTestCancelCause.APPLICATION_SHUTDOWN;
+            }
+            terminal = true;
+        }
+
+        private synchronized DockerTestCancelCause cancelCause() {
+            if (cancelCause == null) {
+                if (external.isCancellationRequested()) {
+                    return DockerTestCancelCause.USER_CANCELLED;
+                }
+                throw new IllegalStateException("The test was not cancelled.");
+            }
+            return cancelCause;
+        }
+
+        private boolean completeIfNotCancelled() {
+            if (cancelCause != null || external.isCancellationRequested()) {
+                if (cancelCause == null) {
+                    cancelCause = DockerTestCancelCause.USER_CANCELLED;
+                }
+                terminal = true;
+                return false;
+            }
+            terminal = true;
+            return true;
         }
     }
 }

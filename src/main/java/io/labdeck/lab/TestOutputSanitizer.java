@@ -40,7 +40,13 @@ public final class TestOutputSanitizer {
             sanitized = sanitized.replace(sensitiveValue, REDACTION);
         }
         sanitized = KEY_VALUE_CREDENTIAL.matcher(sanitized).replaceAll("$1$2" + REDACTION);
-        return BEARER_CREDENTIAL.matcher(sanitized).replaceAll("Bearer " + REDACTION);
+        sanitized = BEARER_CREDENTIAL.matcher(sanitized).replaceAll("Bearer " + REDACTION);
+        StringBuilder safe = new StringBuilder(sanitized.length());
+        sanitized.codePoints().forEach(codePoint -> safe.appendCodePoint(
+                ((Character.isISOControl(codePoint) && codePoint != '\n' && codePoint != '\t')
+                                || Character.getType(codePoint) == Character.FORMAT)
+                        ? 0xfffd : codePoint));
+        return safe.toString();
     }
 
     @Override

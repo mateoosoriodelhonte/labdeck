@@ -19,13 +19,14 @@ less time fighting dependencies and more time working on the assignment.
 - Versioned local lab API with strict JSON, session CSRF, Host and Origin checks, and safe problem
   details.
 - Workspace import, plan review, revision-checked start and stop, owned service inspection, and
-  bounded test-history reads.
+  constrained manifest-defined assignment tests with durable bounded history.
 - Closed v1 manifest schema, bounded YAML parser, semantic validator, and deterministic plan.
 - Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
 - Public-image inspection and confirmed pulls without Docker registry credentials.
 - Journaled Docker containers, private networks, persistent-volume identity, and exact cleanup.
 - Dynamic or fixed TCP ports bound only to `127.0.0.1`, with clear fixed-port conflicts.
 - Lab-wide memory and CPU ceilings divided across services, with Docker swap disabled.
+- A fixed 256-process PID limit and init reaper for each service container.
 - Docker health readiness, bounded cancellation, unexpected-exit monitoring, and safe failure records.
 - Exact-owned service metrics, stable topology, endpoints, and honest disk-use availability.
 - Rotated local Docker logs with bounded history, bounded server-sent streams, and Stop cancellation.
@@ -107,7 +108,8 @@ Architecture decisions are recorded in
 [ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md), and
 [ADR-0005](docs/decisions/0005-local-ports-resource-budgets-and-readiness.md), and
 [ADR-0006](docs/decisions/0006-safe-local-api.md), and
-[ADR-0007](docs/decisions/0007-bounded-owned-observability-and-logs.md).
+[ADR-0007](docs/decisions/0007-bounded-owned-observability-and-logs.md), and
+[ADR-0008](docs/decisions/0008-constrained-assignment-test-runner.md).
 
 ## Safety and privacy
 
@@ -146,3 +148,5 @@ The safe local API is tracked in
 [issue #7](https://github.com/mateoosoriodelhonte/labdeck/issues/7).
 Bounded observability and logs are tracked in
 [issue #8](https://github.com/mateoosoriodelhonte/labdeck/issues/8).
+Constrained assignment test execution is tracked in
+[issue #9](https://github.com/mateoosoriodelhonte/labdeck/issues/9).

@@ -82,7 +82,8 @@ final class LabManifestValidator {
     private static final Set<String> SENSITIVE_CONTAINER_PATHS = Set.of(
             "/", "/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var/run");
     private static final Set<String> SHELLS = Set.of(
-            "sh", "bash", "zsh", "/bin/sh", "/bin/bash", "/bin/zsh", "cmd", "cmd.exe", "powershell", "pwsh");
+            "sh", "bash", "zsh", "dash", "ash", "ksh", "csh", "tcsh", "fish",
+            "cmd", "cmd.exe", "powershell", "pwsh");
     private static final Set<String> SHELL_EXECUTE_FLAGS = Set.of("-c", "/c", "-command");
 
     LabManifest validate(JsonNode root) {
@@ -529,12 +530,74 @@ final class LabManifestValidator {
     }
 
     private static boolean usesShell(List<String> command) {
-        if (command.size() < 2) {
+        return usesShellAt(command, 0);
+    }
+
+    private static boolean usesShellAt(List<String> command, int offset) {
+        if (command.size() <= offset) {
             return false;
         }
-        String executable = command.getFirst().toLowerCase(Locale.ROOT);
-        String flag = command.get(1).toLowerCase(Locale.ROOT);
-        return SHELLS.contains(executable) && SHELL_EXECUTE_FLAGS.contains(flag);
+        String executable = executableName(command.get(offset));
+        if (command.size() >= offset + 2
+                && SHELLS.contains(executable)
+                && SHELL_EXECUTE_FLAGS.contains(command.get(offset + 1).toLowerCase(Locale.ROOT))) {
+            return true;
+        }
+        if ("env".equals(executable)) {
+            int nestedCommand = envCommandIndex(command, offset);
+            return nestedCommand == -2 || (nestedCommand >= 0 && usesShellAt(command, nestedCommand));
+        }
+        if (!"busybox".equals(executable) || command.size() < offset + 2) {
+            return false;
+        }
+        String applet = executableName(command.get(offset + 1));
+        if ("env".equals(applet)) {
+            return usesShellAt(command, offset + 1);
+        }
+        return command.size() >= offset + 3
+                && SHELLS.contains(applet)
+                && SHELL_EXECUTE_FLAGS.contains(command.get(offset + 2).toLowerCase(Locale.ROOT));
+    }
+
+    private static int envCommandIndex(List<String> command, int envOffset) {
+        for (int index = envOffset + 1; index < command.size(); index++) {
+            String argument = command.get(index);
+            if ("--".equals(argument)) {
+                return index + 1 < command.size() ? index + 1 : -1;
+            }
+            if (isEnvSplitStringOption(argument)) {
+                return -2;
+            }
+            if (argument.indexOf('=') > 0
+                    || Set.of("-i", "--ignore-environment", "-0", "--null").contains(argument)
+                    || argument.startsWith("--unset=")
+                    || argument.startsWith("--chdir=")) {
+                continue;
+            }
+            if (Set.of("-u", "--unset", "-C", "--chdir").contains(argument)) {
+                index++;
+                continue;
+            }
+            if (argument.startsWith("-")) {
+                continue;
+            }
+            return index;
+        }
+        return -1;
+    }
+
+    private static boolean isEnvSplitStringOption(String argument) {
+        return argument.equals("--split-string")
+                || argument.startsWith("--split-string=")
+                || (argument.startsWith("-")
+                        && !argument.startsWith("--")
+                        && argument.substring(1).contains("S"));
+    }
+
+    private static String executableName(String value) {
+        String normalized = value.replace('\\', '/').toLowerCase(Locale.ROOT);
+        int separator = normalized.lastIndexOf('/');
+        return separator < 0 ? normalized : normalized.substring(separator + 1);
     }
 
     private static long parseMemory(JsonNode node, String path, Problems problems) {

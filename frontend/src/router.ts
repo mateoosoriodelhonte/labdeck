@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import LabsView from './views/LabsView.vue'
+import LabDetailView from './views/LabDetailView.vue'
 import PlaceholderView from './views/PlaceholderView.vue'
 
 export const router = createRouter({
@@ -10,8 +11,7 @@ export const router = createRouter({
     { path: '/labs', component: LabsView },
     {
       path: '/labs/:labId',
-      component: PlaceholderView,
-      props: { title: 'Lab detail', description: 'Service details are being connected.' },
+      component: LabDetailView,
     },
     {
       path: '/templates',
