@@ -84,6 +84,57 @@ class RestrictedManifestParserTests {
         assertThat(first).isEqualTo(second);
     }
 
+    @Test
+    void rejectsOneFixedHostPortRequestedByTwoServices() {
+        String yaml = minimalManifest("""
+                services:
+                  database:
+                    image: postgres:17
+                    ports: [{container: 5432, host: 15432}]
+                  app:
+                    image: python:3.12
+                    ports: [{container: 8000, host: 15432}]
+                """);
+
+        assertThatThrownBy(() -> parser.parse(yaml))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception ->
+                        assertThat(exception.problems())
+                                .anySatisfy(problem -> {
+                                    assertThat(problem.code())
+                                            .isEqualTo(ManifestProblemCode.MANIFEST_PORT_POLICY_VIOLATION);
+                                    assertThat(problem.path())
+                                            .isEqualTo("/services/database/ports/0/host");
+                                    assertThat(problem.message())
+                                            .contains("15432", "app");
+                                }));
+    }
+
+    @Test
+    void rejectsALabBudgetTooSmallForItsServiceCount() {
+        String services = java.util.stream.IntStream.range(0, 11)
+                .mapToObj(index -> "  app" + index + ":\n    image: busybox:1.37\n")
+                .collect(java.util.stream.Collectors.joining());
+        String yaml = """
+                version: 1
+                name: Small shared budget
+                workspace:
+                  mount: /workspace
+                services:
+                """ + services + """
+                resources:
+                  memory: 64MiB
+                  cpus: 0.25
+                """;
+
+        assertThatThrownBy(() -> parser.parse(yaml))
+                .isInstanceOfSatisfying(ManifestValidationException.class, exception ->
+                        assertThat(exception.problems()).anySatisfy(problem -> {
+                            assertThat(problem.code())
+                                    .isEqualTo(ManifestProblemCode.MANIFEST_RESOURCE_LIMIT_INVALID);
+                            assertThat(problem.path()).isEqualTo("/resources/memory");
+                        }));
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("unsafeManifests")
     void rejectsNamedUnsafeInputs(

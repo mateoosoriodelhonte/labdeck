@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. The internal-network choice is superseded by ADR-0005.
 
 ## Date
 
@@ -42,7 +42,9 @@ one exact match, rejects more than one, and stores the returned identity. One em
 prove that an ambiguous create failed. The row stays open and blocks reuse until a later exact
 reconciliation succeeds. LabDeck does not retry the create blindly.
 
-Use one internal, non-attachable bridge network per running lab. Pre-create every manifest volume
+Use one internal, non-attachable bridge network per running lab. ADR-0005 later replaces the
+internal network with a dedicated non-attachable bridge because Docker does not publish usable
+host ports from an internal bridge. Pre-create every manifest volume
 with the local driver and ownership labels. Preserve named volumes during normal stop, cancellation,
 and failed-start cleanup. Never call a Docker prune endpoint. Never remove pulled images.
 
@@ -79,8 +81,8 @@ endpoints are rejected in v1.
 - A SQLite row is an ownership hint, not authority by itself. Engine inspection must also match.
 - A process that controls the Docker socket remains host-powerful. LabDeck prevents its own broad
   cleanup mistakes; it cannot defend the host from another Docker administrator.
-- Internal networks reduce unintended outbound access. A later outbound-network feature needs an
-  explicit trust and user-consent design.
+- The original internal-network consequence is superseded by ADR-0005. V1 documents normal Docker
+  bridge outbound behavior and does not claim an offline sandbox.
 - Named volumes survive stop and failed startup. A later disk-management feature must add a separate
   reference check and confirmation flow before deletion.
 - Resource limits, port publishing, collision handling, and health readiness remain in issue #6.

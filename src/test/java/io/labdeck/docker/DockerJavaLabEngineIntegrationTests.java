@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import io.labdeck.lab.LabFailureCode;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabState;
 import io.labdeck.manifest.ManifestPlan;
@@ -20,6 +21,13 @@ import io.labdeck.persistence.sqlite.SQLiteDataSourceFactory;
 import io.labdeck.persistence.sqlite.SQLiteDockerResourceJournal;
 import io.labdeck.persistence.sqlite.SQLiteLabRepository;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -29,7 +37,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -107,9 +120,31 @@ class DockerJavaLabEngineIntegrationTests {
             assertThat(started.containers()).singleElement().satisfies(container -> {
                 assertThat(container.running()).isTrue();
                 assertThat(container.status()).isEqualTo("running");
+                assertThat(container.health()).isEqualTo(DockerHealthStatus.HEALTHY);
+                assertThat(container.ports()).singleElement().satisfies(port -> {
+                    assertThat(port.containerPort()).isEqualTo(8000);
+                    assertThat(port.hostAddress()).isEqualTo("127.0.0.1");
+                    assertThat(port.hostPort()).isBetween(1024, 65_535);
+                });
             });
+            DockerPortMapping endpoint = started.containers().getFirst().ports().getFirst();
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(
+                                    "http://127.0.0.1:" + endpoint.hostPort() + "/workspace-marker.txt"))
+                            .timeout(Duration.ofSeconds(5))
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body()).isEqualTo("workspace survives");
+            HostConfig appliedLimits = docker.inspectContainerCmd(started.containers().getFirst().id())
+                    .exec().getHostConfig();
+            assertThat(appliedLimits.getMemory()).isEqualTo(64L * 1024 * 1024);
+            assertThat(appliedLimits.getMemorySwap()).isEqualTo(64L * 1024 * 1024);
+            assertThat(appliedLimits.getNanoCPUs()).isEqualTo(250_000_000L);
+            assertThat(appliedLimits.getOomKillDisable()).isNotEqualTo(Boolean.TRUE);
             assertThat(docker.inspectNetworkCmd().withNetworkId(started.networkId()).exec().getInternal())
-                    .isTrue();
+                    .isFalse();
             assertThat(docker.inspectVolumeCmd(volume.engineId().orElseThrow()).exec().getLabels())
                     .containsAllEntriesOf(volume.labels());
 
@@ -146,6 +181,8 @@ class DockerJavaLabEngineIntegrationTests {
                     .isInstanceOf(DockerOwnershipException.class)
                     .hasMessageContaining("replacement volume");
             assertThat(labs.findById(labId).orElseThrow().state()).isEqualTo(LabState.FAILED);
+            assertThat(labs.findRuntimeFailure(labId).orElseThrow().code())
+                    .isEqualTo(LabFailureCode.OWNERSHIP_MISMATCH);
             assertThat(docker.inspectContainerCmd(sentinelId).exec().getState().getRunning()).isTrue();
         } finally {
             if (lifecycle != null) {
@@ -154,6 +191,7 @@ class DockerJavaLabEngineIntegrationTests {
                 } catch (RuntimeException ignored) {
                     // Exact-ID teardown below handles a failed product cleanup.
                 }
+                lifecycle.close();
             }
             if (journal != null) {
                 cleanupJournaledResources(engine, docker, journal, new LabOwnership(labId, projectId));
@@ -172,6 +210,130 @@ class DockerJavaLabEngineIntegrationTests {
         }
     }
 
+    @Test
+    void unhealthyServiceFailsDurablyAndCleansEphemeralResources() throws Exception {
+        String name = "Unhealthy Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(name)) {
+            ManifestPlan unhealthy = compile("""
+                    version: 1
+                    name: Unhealthy Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "60"]
+                        healthcheck:
+                          command: ["false"]
+                          interval: 1s
+                          timeout: 1s
+                          retries: 1
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    """);
+
+            assertThatThrownBy(() -> scenario.lifecycle.start(
+                    scenario.lab, unhealthy, CancellationToken.NONE))
+                    .isInstanceOfSatisfying(DockerServiceReadinessException.class, failure ->
+                            assertThat(failure.reason())
+                                    .isEqualTo(DockerServiceReadinessException.Reason.UNHEALTHY));
+
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.FAILED);
+            var failure = scenario.labs.findRuntimeFailure(scenario.labId).orElseThrow();
+            assertThat(failure.code()).isEqualTo(LabFailureCode.HEALTHCHECK_UNHEALTHY);
+            assertThat(failure.service()).contains("app");
+            assertThat(failure.safeMessage()).doesNotContain("false");
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+        }
+    }
+
+    @Test
+    void fixedPortCollisionReturnsAnActionableFailureWithoutClosingTheListener() throws Exception {
+        String name = "Port collision Docker integration lab";
+        try (ServerSocket listener = new ServerSocket();
+                DockerScenario scenario = new DockerScenario(name)) {
+            listener.setReuseAddress(false);
+            listener.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0));
+            int occupiedPort = listener.getLocalPort();
+            ManifestPlan collision = compile(("""
+                    version: 1
+                    name: Port collision Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "60"]
+                        ports:
+                          - container: 8000
+                            host: %d
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    """).formatted(occupiedPort));
+
+            assertThatThrownBy(() -> scenario.lifecycle.start(
+                    scenario.lab, collision, CancellationToken.NONE))
+                    .isInstanceOfSatisfying(DockerPortCollisionException.class, failure -> {
+                        assertThat(failure.service()).isEqualTo("app");
+                        assertThat(failure.hostPorts()).containsExactly(occupiedPort);
+                        assertThat(failure.getMessage()).contains("choose a different host port");
+                    });
+
+            assertThat(listener.isBound()).isTrue();
+            assertThat(listener.isClosed()).isFalse();
+            assertThat(scenario.labs.findRuntimeFailure(scenario.labId).orElseThrow().code())
+                    .isEqualTo(LabFailureCode.HOST_PORT_IN_USE);
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+        }
+    }
+
+    @Test
+    void cancellationDuringHealthReadinessStopsAndCleansTheLab() throws Exception {
+        String name = "Cancelled Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(name);
+                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            ManifestPlan waiting = compile("""
+                    version: 1
+                    name: Cancelled Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "120"]
+                        healthcheck:
+                          command: ["test", "-f", "/never-ready"]
+                          interval: 1s
+                          timeout: 1s
+                          retries: 20
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    """);
+            AtomicBoolean cancelled = new AtomicBoolean();
+            Future<?> start = executor.submit(() -> scenario.lifecycle.start(
+                    scenario.lab, waiting, cancelled::get));
+            scenario.awaitManagedContainer(Duration.ofSeconds(10));
+
+            cancelled.set(true);
+
+            assertThatThrownBy(() -> start.get(20, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(DockerOperationCancelledException.class);
+            assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
+                    .isEqualTo(LabState.STOPPED);
+            assertThat(scenario.labs.findRuntimeFailure(scenario.labId)).isEmpty();
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+        }
+    }
+
+    private static ManifestPlan compile(String yaml) {
+        return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
+    }
+
     private static ManifestPlan plan() {
         String yaml = """
                 version: 1
@@ -181,12 +343,111 @@ class DockerJavaLabEngineIntegrationTests {
                 services:
                   app:
                     image: busybox:1.37
-                    command: ["sleep", "120"]
+                    working_dir: /workspace
+                    command: ["httpd", "-f", "-p", "8000", "-h", "/workspace"]
+                    ports:
+                      - container: 8000
+                    healthcheck:
+                      command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/workspace-marker.txt"]
+                      interval: 1s
+                      timeout: 1s
+                      retries: 5
                     volumes:
                       - name: course-data
                         target: /data
+                resources:
+                  memory: 64MiB
+                  cpus: 0.25
                 """;
         return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
+    }
+
+    private static final class DockerScenario implements AutoCloseable {
+        private final String run;
+        private final String labId;
+        private final String projectId;
+        private final Path runDirectory;
+        private final DockerClient docker;
+        private final DockerJavaLabEngine engine;
+        private final LockedSQLiteDataSource dataSource;
+        private final SQLiteLabRepository labs;
+        private final SQLiteDockerResourceJournal journal;
+        private final LabRecord lab;
+        private final DockerLabLifecycle lifecycle;
+
+        private DockerScenario(String name) throws Exception {
+            run = UUID.randomUUID().toString().replace("-", "");
+            labId = "it-" + run.substring(0, 12);
+            projectId = "project-" + run.substring(0, 12);
+            runDirectory = Path.of(System.getProperty("user.dir"), "target", "docker-it", run);
+            Path workspace = Files.createDirectories(runDirectory.resolve("workspace"));
+            docker = new DockerClientConfiguration().labDeckDockerClient("");
+            engine = new DockerJavaLabEngine(docker);
+            engine.verifyAvailable();
+            if (engine.inspectImage(IMAGE).isEmpty()) {
+                engine.pullPublicImageAfterConfirmation(
+                        IMAGE, Duration.ofMinutes(5), CancellationToken.NONE);
+            }
+            dataSource = new SQLiteDataSourceFactory().create(runDirectory.resolve("data"));
+            Flyway.configure()
+                    .dataSource(dataSource)
+                    .locations("classpath:db/migration")
+                    .cleanDisabled(true)
+                    .load()
+                    .migrate();
+            labs = new SQLiteLabRepository(dataSource);
+            journal = new SQLiteDockerResourceJournal(dataSource);
+            lab = new LabRecord(
+                    labId,
+                    projectId,
+                    name,
+                    1,
+                    workspace,
+                    LabState.IMPORTED,
+                    0,
+                    Instant.now(),
+                    Instant.now());
+            labs.create(lab);
+            lifecycle = new DockerLabLifecycle(engine, journal, labs);
+        }
+
+        private void awaitManagedContainer(Duration timeout) throws Exception {
+            long deadline = System.nanoTime() + timeout.toNanos();
+            while (System.nanoTime() < deadline) {
+                var containers = docker.listContainersCmd()
+                        .withShowAll(true)
+                        .withLabelFilter(Map.of(
+                                LabOwnership.MANAGED_LABEL, "true",
+                                LabOwnership.LAB_LABEL, labId,
+                                LabOwnership.PROJECT_LABEL, projectId,
+                                LabOwnership.TYPE_LABEL, "container"))
+                        .exec();
+                if (!containers.isEmpty()) {
+                    return;
+                }
+                Thread.sleep(25);
+            }
+            throw new IllegalStateException("The integration container did not start in time.");
+        }
+
+        @Override
+        public void close() throws Exception {
+            try {
+                try {
+                    lifecycle.stop(labId);
+                } catch (RuntimeException ignored) {
+                    // Exact journal cleanup below handles a failed product cleanup.
+                }
+                lifecycle.close();
+                cleanupJournaledResources(
+                        engine, docker, journal, new LabOwnership(labId, projectId));
+                assertNoJournaledEngineResources(docker, labId, projectId);
+            } finally {
+                dataSource.close();
+                docker.close();
+                deleteGeneratedDirectory(runDirectory);
+            }
+        }
     }
 
     private static void writeVolumeMarker(DockerClient docker, String containerId) throws Exception {

@@ -104,7 +104,9 @@ final class LabManifestValidator {
         String name = parseName(document.get("name"), problems);
         Workspace workspace = parseWorkspace(document.get("workspace"), problems);
         NavigableMap<String, Service> services = parseServices(document.get("services"), workspace.mount(), problems);
+        validateUniqueHostPorts(services, problems);
         ResourceLimits resources = parseResources(document.get("resources"), problems);
+        validateResourceBudget(resources, services.size(), problems);
         Optional<TestDefinition> tests = parseTests(document.get("tests"), services.keySet(), problems);
 
         if (problems.hasProblems()) {
@@ -357,6 +359,28 @@ final class LabManifestValidator {
         return Optional.of(new HealthCheck(command, interval, timeout, retries, startPeriod));
     }
 
+    private static void validateUniqueHostPorts(
+            NavigableMap<String, Service> services, Problems problems) {
+        Map<Integer, String> firstServiceByPort = new HashMap<>();
+        services.forEach((serviceId, service) -> {
+            for (int index = 0; index < service.ports().size(); index++) {
+                Port port = service.ports().get(index);
+                if (port.host().isEmpty()) {
+                    continue;
+                }
+                int hostPort = port.host().orElseThrow();
+                String firstService = firstServiceByPort.putIfAbsent(hostPort, serviceId);
+                if (firstService != null && !firstService.equals(serviceId)) {
+                    problems.add(
+                            MANIFEST_PORT_POLICY_VIOLATION,
+                            pointer("/services", serviceId) + "/ports/" + index + "/host",
+                            "Host port " + hostPort + " is already requested by service '"
+                                    + firstService + "'.");
+                }
+            }
+        });
+    }
+
     private static List<VolumeMount> parseVolumes(
             JsonNode node, String path, String workspaceMount, Problems problems) {
         if (node == null || node.isNull()) {
@@ -428,6 +452,27 @@ final class LabManifestValidator {
         long memory = parseMemory(resources.get("memory"), "/resources/memory", problems);
         BigDecimal cpus = parseCpus(resources.get("cpus"), "/resources/cpus", problems);
         return new ResourceLimits(memory, cpus);
+    }
+
+    private static void validateResourceBudget(
+            ResourceLimits resources, int serviceCount, Problems problems) {
+        if (serviceCount < 1) {
+            return;
+        }
+        long minimumMemory = 6L * 1024 * 1024 * serviceCount;
+        if (resources.memoryBytes() < minimumMemory) {
+            problems.add(
+                    MANIFEST_RESOURCE_LIMIT_INVALID,
+                    "/resources/memory",
+                    "The lab memory must allow at least 6MiB for each service.");
+        }
+        BigDecimal minimumCpus = new BigDecimal("0.01").multiply(BigDecimal.valueOf(serviceCount));
+        if (resources.cpus().compareTo(minimumCpus) < 0) {
+            problems.add(
+                    MANIFEST_RESOURCE_LIMIT_INVALID,
+                    "/resources/cpus",
+                    "The lab CPU limit must allow at least 0.01 CPU for each service.");
+        }
     }
 
     private static Optional<TestDefinition> parseTests(

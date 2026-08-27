@@ -12,9 +12,12 @@ import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.BindOptions;
 import com.github.dockerjava.api.model.BindPropagation;
 import com.github.dockerjava.api.model.ContainerConfig;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.RestartPolicy;
 import com.github.dockerjava.api.command.PullImageResultCallback;
 import com.github.dockerjava.core.DockerClientImpl;
@@ -27,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -63,6 +67,36 @@ public class DockerJavaLabEngine implements DockerEnginePort {
     }
 
     @Override
+    public void verifyLocalPortPublishingSupported() {
+        String version = docker.versionCmd().exec().getVersion();
+        int separator = version == null ? -1 : version.indexOf('.');
+        if (separator < 1) {
+            throw new IllegalStateException("Docker did not report a supported Engine version.");
+        }
+        int major;
+        try {
+            major = Integer.parseInt(version.substring(0, separator));
+        } catch (NumberFormatException exception) {
+            throw new IllegalStateException("Docker did not report a supported Engine version.", exception);
+        }
+        if (major < 28) {
+            throw new IllegalStateException(
+                    "Published localhost ports require Docker Engine 28 or newer. Update the local Docker engine.");
+        }
+    }
+
+    @Override
+    public void verifyResourceLimitsSupported() {
+        var info = docker.infoCmd().exec();
+        if (!Boolean.TRUE.equals(info.getMemoryLimit())
+                || !Boolean.TRUE.equals(info.getSwapLimit())
+                || !Boolean.TRUE.equals(info.getCpuCfsQuota())) {
+            throw new IllegalStateException(
+                    "The local Docker engine does not support the required memory, swap, and CPU limits.");
+        }
+    }
+
+    @Override
     public Optional<DockerImageMetadata> inspectImage(String reference) {
         requireImageReference(reference);
         try {
@@ -70,8 +104,13 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             ContainerConfig config = image.getConfig();
             Map<String, ?> declaredVolumes = config == null ? null : config.getVolumes();
             Set<String> targets = declaredVolumes == null ? Set.of() : Set.copyOf(declaredVolumes.keySet());
+            HealthCheck health = config == null ? null : config.getHealthcheck();
+            boolean healthConfigured = health != null
+                    && health.getTest() != null
+                    && !health.getTest().isEmpty()
+                    && !health.getTest().equals(List.of("NONE"));
             return Optional.of(new DockerImageMetadata(
-                    image.getId(), image.getSize() == null ? 0 : image.getSize(), targets));
+                    image.getId(), image.getSize() == null ? 0 : image.getSize(), targets, healthConfigured));
         } catch (NotFoundException exception) {
             return Optional.empty();
         }
@@ -172,7 +211,7 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         String id = docker.createNetworkCmd()
                 .withName(engineName(dispatched))
                 .withDriver("bridge")
-                .withInternal(true)
+                .withInternal(false)
                 .withAttachable(false)
                 .withCheckDuplicate(false)
                 .withLabels(dispatched.labels())
@@ -182,7 +221,7 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         var created = docker.inspectNetworkCmd().withNetworkId(id).exec();
         if (!dispatched.hasExactLabels(created.getLabels())
                 || !"bridge".equals(created.getDriver())
-                || !Boolean.TRUE.equals(created.getInternal())
+                || Boolean.TRUE.equals(created.getInternal())
                 || Boolean.TRUE.equals(created.isAttachable())) {
             throw new DockerOwnershipException("Docker did not create the planned private bridge network.");
         }
@@ -238,9 +277,24 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withTarget(volume.target())
                 .withReadOnly(volume.readOnly())));
 
+        List<ExposedPort> exposedPorts = specification.publishedPorts().stream()
+                .map(port -> ExposedPort.tcp(port.containerPort()))
+                .toList();
+        Ports portBindings = new Ports();
+        specification.publishedPorts().forEach(port -> portBindings.bind(
+                ExposedPort.tcp(port.containerPort()),
+                port.hostPort().isPresent()
+                        ? Ports.Binding.bindIpAndPort("127.0.0.1", port.hostPort().orElseThrow())
+                        : new Ports.Binding("127.0.0.1", "")));
+
         HostConfig hostConfig = HostConfig.newHostConfig()
                 .withNetworkMode(specification.networkId())
                 .withMounts(mounts)
+                .withPortBindings(portBindings)
+                .withMemory(specification.resourceLimits().memoryBytes())
+                .withMemorySwap(specification.resourceLimits().memoryBytes())
+                .withNanoCPUs(specification.resourceLimits().nanoCpus())
+                .withOomKillDisable(false)
                 .withAutoRemove(false)
                 .withPrivileged(false)
                 .withPublishAllPorts(false)
@@ -252,7 +306,9 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withAliases(dispatched.logicalName())
                 .withWorkingDir(specification.workingDirectory())
                 .withEnv(environment(specification.environment()))
+                .withExposedPorts(exposedPorts)
                 .withHostConfig(hostConfig);
+        specification.healthProbe().ifPresent(ignored -> command.withHealthcheck(healthCheck(specification)));
         if (!specification.command().isEmpty()) {
             command.withCmd(specification.command());
         }
@@ -265,22 +321,33 @@ public class DockerJavaLabEngine implements DockerEnginePort {
     }
 
     @Override
-    public DockerContainerView inspectContainer(DockerResourceRecord active) {
+    public DockerContainerView inspectContainer(
+            DockerResourceRecord active, DockerContainerSpec specification) {
         requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        Objects.requireNonNull(specification, "specification");
         InspectContainerResponse inspection = inspectOwnedContainer(active);
+        requireContainerShape(inspection, specification);
         var state = inspection.getState();
         String status = state == null || state.getStatus() == null ? "unknown" : state.getStatus();
         boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+        OptionalInt exitCode = !running && state != null && state.getExitCodeLong() != null
+                ? OptionalInt.of(Math.toIntExact(state.getExitCodeLong()))
+                : OptionalInt.empty();
+        DockerHealthStatus health = healthStatus(state == null ? null : state.getHealth());
         String name = inspection.getName() == null ? "" : inspection.getName().replaceFirst("^/", "");
         String image = inspection.getConfig() == null || inspection.getConfig().getImage() == null
                 ? "unknown" : inspection.getConfig().getImage();
-        return new DockerContainerView(inspection.getId(), name, image, status, running);
+        return new DockerContainerView(
+                inspection.getId(), active.logicalName(), name, image, status, running,
+                exitCode, health, inspectPublishedPorts(inspection, specification));
     }
 
     @Override
-    public void startContainer(DockerResourceRecord active) {
+    public void startContainer(
+            DockerResourceRecord active, DockerContainerSpec specification) {
         requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
-        inspectOwnedContainer(active);
+        Objects.requireNonNull(specification, "specification");
+        requireContainerShape(inspectOwnedContainer(active), specification);
         try {
             docker.startContainerCmd(active.engineId().orElseThrow()).exec();
         } catch (RuntimeException ambiguousFailure) {
@@ -288,6 +355,13 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             if (reconciled.getState() != null
                     && Boolean.TRUE.equals(reconciled.getState().getRunning())) {
                 return;
+            }
+            List<Integer> fixedPorts = specification.publishedPorts().stream()
+                    .flatMap(port -> port.hostPort().stream())
+                    .sorted()
+                    .toList();
+            if (!fixedPorts.isEmpty() && isPortCollision(ambiguousFailure)) {
+                throw new DockerPortCollisionException(active.logicalName(), fixedPorts, ambiguousFailure);
             }
             throw ambiguousFailure;
         }
@@ -442,10 +516,20 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         if (actual.getConfig() == null
                 || !expected.image().equals(actual.getConfig().getImage())
                 || actual.getHostConfig() == null
-                || !expected.networkId().equals(actual.getHostConfig().getNetworkMode())) {
+                || !expected.networkId().equals(actual.getHostConfig().getNetworkMode())
+                || !Long.valueOf(expected.resourceLimits().memoryBytes())
+                        .equals(actual.getHostConfig().getMemory())
+                || !Long.valueOf(expected.resourceLimits().memoryBytes())
+                        .equals(actual.getHostConfig().getMemorySwap())
+                || !Long.valueOf(expected.resourceLimits().nanoCpus())
+                        .equals(actual.getHostConfig().getNanoCPUs())
+                || Boolean.TRUE.equals(actual.getHostConfig().getPublishAllPorts())
+                || Boolean.TRUE.equals(actual.getHostConfig().getOomKillDisable())) {
             throw new DockerOwnershipException(
-                    "Docker created a container with a different image or network than planned.");
+                    "Docker created a container with different image, network, or resource limits than planned.");
         }
+        requirePortBindingShape(actual, expected);
+        requireHealthCheckShape(actual, expected);
         Map<String, InspectContainerResponse.Mount> mountsByTarget = actual.getMounts() == null
                 ? Map.of()
                 : actual.getMounts().stream().collect(java.util.stream.Collectors.toMap(
@@ -466,6 +550,150 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 throw new DockerOwnershipException("Docker did not create the planned named-volume mount.");
             }
         }
+    }
+
+    private static void requirePortBindingShape(
+            InspectContainerResponse actual, DockerContainerSpec expected) {
+        Set<ExposedPort> expectedExposed = expected.publishedPorts().stream()
+                .map(port -> ExposedPort.tcp(port.containerPort()))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        ExposedPort[] actualExposedArray = actual.getConfig().getExposedPorts();
+        Set<ExposedPort> actualExposed = actualExposedArray == null
+                ? Set.of() : Set.of(actualExposedArray);
+        if (!actualExposed.containsAll(expectedExposed)) {
+            throw new DockerOwnershipException("Docker did not preserve every planned exposed port.");
+        }
+        Map<ExposedPort, Ports.Binding[]> actualBindings = actual.getHostConfig().getPortBindings() == null
+                ? Map.of() : actual.getHostConfig().getPortBindings().getBindings();
+        if (actualBindings.size() != expected.publishedPorts().size()) {
+            throw new DockerOwnershipException("Docker created different host port bindings than planned.");
+        }
+        for (DockerContainerSpec.PublishedPort port : expected.publishedPorts()) {
+            Ports.Binding[] bindings = actualBindings.get(ExposedPort.tcp(port.containerPort()));
+            if (bindings == null || bindings.length != 1
+                    || !"127.0.0.1".equals(bindings[0].getHostIp())) {
+                throw new DockerOwnershipException("Docker did not bind the planned port to localhost.");
+            }
+            String actualHostPort = bindings[0].getHostPortSpec();
+            if (port.hostPort().isPresent()
+                    && !Integer.toString(port.hostPort().orElseThrow()).equals(actualHostPort)) {
+                throw new DockerOwnershipException("Docker created a different fixed host port than planned.");
+            }
+            if (port.hostPort().isEmpty() && actualHostPort != null && !actualHostPort.isBlank()) {
+                throw new DockerOwnershipException("Docker did not preserve the planned dynamic host port.");
+            }
+        }
+    }
+
+    private static void requireHealthCheckShape(
+            InspectContainerResponse actual, DockerContainerSpec expected) {
+        HealthCheck actualHealth = actual.getConfig().getHealthcheck();
+        if (expected.healthProbe().isPresent()) {
+            DockerContainerSpec.HealthProbe probe = expected.healthProbe().orElseThrow();
+            List<String> expectedTest = java.util.stream.Stream.concat(
+                            java.util.stream.Stream.of("CMD"), probe.command().stream())
+                    .toList();
+            if (actualHealth == null || !expectedTest.equals(actualHealth.getTest())) {
+                throw new DockerOwnershipException("Docker created a different health command than planned.");
+            }
+            if (!Long.valueOf(probe.interval().toNanos()).equals(actualHealth.getInterval())
+                    || !Long.valueOf(probe.timeout().toNanos()).equals(actualHealth.getTimeout())
+                    || !Integer.valueOf(probe.retries()).equals(actualHealth.getRetries())
+                    || normalizedNanoseconds(actualHealth.getStartPeriod())
+                            != probe.startPeriod().toNanos()
+                    || !Long.valueOf(probe.interval().toNanos()).equals(actualHealth.getStartInterval())) {
+                throw new DockerOwnershipException("Docker created different health timing than planned.");
+            }
+            return;
+        }
+        boolean actualConfigured = actualHealth != null
+                && actualHealth.getTest() != null
+                && !actualHealth.getTest().isEmpty()
+                && !actualHealth.getTest().equals(List.of("NONE"));
+        if (actualConfigured != expected.imageHealthCheckConfigured()) {
+            throw new DockerOwnershipException("Docker did not preserve the image health policy.");
+        }
+    }
+
+    private static HealthCheck healthCheck(DockerContainerSpec specification) {
+        return specification.healthProbe()
+                .map(probe -> new HealthCheck()
+                        .withTest(java.util.stream.Stream.concat(
+                                        java.util.stream.Stream.of("CMD"), probe.command().stream())
+                                .toList())
+                        .withInterval(probe.interval().toNanos())
+                        .withTimeout(probe.timeout().toNanos())
+                        .withRetries(probe.retries())
+                        .withStartPeriod(probe.startPeriod().toNanos())
+                        .withStartInterval(probe.interval().toNanos()))
+                .orElseThrow();
+    }
+
+    private static long normalizedNanoseconds(Long value) {
+        return value == null ? 0L : value;
+    }
+
+    private static DockerHealthStatus healthStatus(com.github.dockerjava.api.command.HealthState health) {
+        if (health == null || health.getStatus() == null) {
+            return DockerHealthStatus.NONE;
+        }
+        return switch (health.getStatus()) {
+            case "starting" -> DockerHealthStatus.STARTING;
+            case "healthy" -> DockerHealthStatus.HEALTHY;
+            case "unhealthy" -> DockerHealthStatus.UNHEALTHY;
+            default -> DockerHealthStatus.UNKNOWN;
+        };
+    }
+
+    private static List<DockerPortMapping> inspectPublishedPorts(
+            InspectContainerResponse actual, DockerContainerSpec expected) {
+        if (expected.publishedPorts().isEmpty()) {
+            return List.of();
+        }
+        if (actual.getNetworkSettings() == null || actual.getNetworkSettings().getPorts() == null) {
+            throw new DockerOwnershipException("Docker did not report the planned port mappings.");
+        }
+        Map<ExposedPort, Ports.Binding[]> bindings = actual.getNetworkSettings().getPorts().getBindings();
+        List<DockerPortMapping> mappings = new ArrayList<>();
+        for (DockerContainerSpec.PublishedPort expectedPort : expected.publishedPorts()) {
+            Ports.Binding[] actualPorts = bindings.get(ExposedPort.tcp(expectedPort.containerPort()));
+            if (actualPorts == null || actualPorts.length != 1) {
+                throw new DockerOwnershipException("Docker did not report one planned host port mapping.");
+            }
+            Ports.Binding binding = actualPorts[0];
+            int hostPort;
+            try {
+                hostPort = Integer.parseInt(binding.getHostPortSpec());
+            } catch (NumberFormatException exception) {
+                throw new DockerOwnershipException("Docker did not report a valid host port.", exception);
+            }
+            if (expectedPort.hostPort().isPresent()
+                    && hostPort != expectedPort.hostPort().orElseThrow()) {
+                throw new DockerOwnershipException("Docker reported a different fixed host port.");
+            }
+            mappings.add(new DockerPortMapping(
+                    expectedPort.containerPort(), binding.getHostIp(), hostPort, expectedPort.protocol()));
+        }
+        return mappings.stream()
+                .sorted(java.util.Comparator.comparingInt(DockerPortMapping::containerPort))
+                .toList();
+    }
+
+    private static boolean isPortCollision(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message == null) {
+                continue;
+            }
+            String normalized = message.toLowerCase(java.util.Locale.ROOT);
+            if (normalized.contains("port is already allocated")
+                    || normalized.contains("address already in use")
+                    || normalized.contains("failed to bind host port")
+                    || normalized.contains("ports are not available")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean hasExactContainerLabels(String id, DockerResourceRecord expected) {

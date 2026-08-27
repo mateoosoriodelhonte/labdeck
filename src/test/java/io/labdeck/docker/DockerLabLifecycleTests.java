@@ -3,13 +3,16 @@ package io.labdeck.docker;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.labdeck.lab.LabFailureCode;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
+import io.labdeck.lab.LabRuntimeFailure;
 import io.labdeck.lab.LabState;
 import io.labdeck.manifest.ManifestPlan;
 import io.labdeck.manifest.ManifestPlanCompiler;
 import io.labdeck.manifest.ProjectPathPolicy;
 import io.labdeck.manifest.RestrictedManifestParser;
+import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -23,8 +26,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -49,12 +59,26 @@ class DockerLabLifecycleTests {
 
         DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
 
-        assertThat(started.lab().state()).isEqualTo(LabState.STARTING);
+        assertThat(started.lab().state()).isEqualTo(LabState.RUNNING);
         assertThat(started.containers()).hasSize(2).allSatisfy(container ->
                 assertThat(container.image()).isEqualTo("sha256:immutable-busybox"));
         assertThat(engine.createdSpecifications.values())
                 .extracting(DockerContainerSpec::image)
                 .containsOnly("sha256:immutable-busybox");
+        assertThat(engine.createdSpecifications.values())
+                .extracting(DockerContainerSpec::resourceLimits)
+                .containsOnly(new DockerContainerSpec.ResourceLimits(
+                        500_000_000L, 1_000_000_000L));
+        assertThat(engine.createdSpecifications.values().stream()
+                        .map(DockerContainerSpec::resourceLimits)
+                        .mapToLong(DockerContainerSpec.ResourceLimits::memoryBytes)
+                        .sum())
+                .isEqualTo(1_000_000_000L);
+        assertThat(engine.createdSpecifications.values().stream()
+                        .map(DockerContainerSpec::resourceLimits)
+                        .mapToLong(DockerContainerSpec.ResourceLimits::nanoCpus)
+                        .sum())
+                .isEqualTo(2_000_000_000L);
         assertThat(engine.resources).containsKey("foreign-sentinel");
 
         LabRecord stopped = lifecycle.stop(lab.id());
@@ -178,6 +202,190 @@ class DockerLabLifecycleTests {
         assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("network-"));
     }
 
+    @Test
+    void stopSignalsAHealthWaitBeforeItTakesTheLifecycleLock() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("stop-during-start"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.healthStatus = DockerHealthStatus.STARTING;
+        CountDownLatch startedContainer = new CountDownLatch(1);
+        engine.afterStart = startedContainer::countDown;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> start = executor.submit(() -> lifecycle.start(lab, plan(), CancellationToken.NONE));
+            assertThat(startedContainer.await(2, TimeUnit.SECONDS)).isTrue();
+
+            LabRecord stopped = lifecycle.stop(lab.id());
+
+            assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+            assertThatThrownBy(() -> start.get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(DockerOperationCancelledException.class);
+            assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
+            assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("network-"));
+        }
+    }
+
+    @Test
+    void anUnhealthyOrExitedServiceNeverCommitsRunning() throws Exception {
+        Path unhealthyWorkspace = Files.createDirectories(temporaryDirectory.resolve("unhealthy"));
+        LabRecord unhealthyLab = lab(unhealthyWorkspace);
+        MemoryLabRepository unhealthyLabs = new MemoryLabRepository(unhealthyLab);
+        MemoryJournal unhealthyJournal = new MemoryJournal();
+        FakeEngine unhealthyEngine = new FakeEngine();
+        unhealthyEngine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        unhealthyEngine.healthStatus = DockerHealthStatus.UNHEALTHY;
+        DockerLabLifecycle unhealthyLifecycle = lifecycle(
+                unhealthyEngine, unhealthyJournal, unhealthyLabs);
+
+        assertThatThrownBy(() -> unhealthyLifecycle.start(
+                unhealthyLab, plan(), CancellationToken.NONE))
+                .isInstanceOfSatisfying(DockerServiceReadinessException.class, exception ->
+                        assertThat(exception.reason())
+                                .isEqualTo(DockerServiceReadinessException.Reason.UNHEALTHY));
+        assertThat(unhealthyLabs.findById(unhealthyLab.id()).orElseThrow().state())
+                .isEqualTo(LabState.FAILED);
+        assertThat(unhealthyLabs.findRuntimeFailure(unhealthyLab.id()).orElseThrow().code())
+                .isEqualTo(LabFailureCode.HEALTHCHECK_UNHEALTHY);
+        assertThat(unhealthyEngine.resources.keySet())
+                .noneMatch(id -> id.startsWith("container-") || id.startsWith("network-"));
+
+        Path exitedWorkspace = Files.createDirectories(temporaryDirectory.resolve("exited"));
+        LabRecord exitedLab = lab(exitedWorkspace);
+        MemoryLabRepository exitedLabs = new MemoryLabRepository(exitedLab);
+        MemoryJournal exitedJournal = new MemoryJournal();
+        FakeEngine exitedEngine = new FakeEngine();
+        exitedEngine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        exitedEngine.afterStart = () -> exitedEngine.containersRunning = false;
+        DockerLabLifecycle exitedLifecycle = lifecycle(exitedEngine, exitedJournal, exitedLabs);
+
+        assertThatThrownBy(() -> exitedLifecycle.start(exitedLab, plan(), CancellationToken.NONE))
+                .isInstanceOfSatisfying(DockerServiceReadinessException.class, exception -> {
+                    assertThat(exception.reason())
+                            .isEqualTo(DockerServiceReadinessException.Reason.EXITED);
+                    assertThat(exception.exitCode()).hasValue(0);
+                });
+        assertThat(exitedLabs.findById(exitedLab.id()).orElseThrow().state())
+                .isEqualTo(LabState.FAILED);
+        assertThat(exitedLabs.findRuntimeFailure(exitedLab.id()).orElseThrow().code())
+                .isEqualTo(LabFailureCode.CONTAINER_EXITED);
+    }
+
+    @Test
+    void aRuntimeExitFailsOnlyTheExactRunningRevision() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("runtime-exit"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        FakeRuntimeMonitor monitor = new FakeRuntimeMonitor();
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs, monitor);
+
+        DockerStartResult first = lifecycle.start(lab, plan(), CancellationToken.NONE);
+        Consumer<DockerRuntimeMonitorPort.RuntimeFailure> oldHandler = monitor.failureHandler;
+        LabRecord stopped = lifecycle.stop(lab.id());
+        DockerStartResult second = lifecycle.start(stopped, plan(), CancellationToken.NONE);
+
+        oldHandler.accept(DockerRuntimeMonitorPort.RuntimeFailure.serviceFailed(
+                DockerServiceReadinessException.exited("app", java.util.OptionalInt.of(0))));
+        assertThat(labs.findById(lab.id()).orElseThrow()).isEqualTo(second.lab());
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.RUNNING);
+
+        monitor.failureHandler.accept(DockerRuntimeMonitorPort.RuntimeFailure.serviceFailed(
+                DockerServiceReadinessException.exited("app", java.util.OptionalInt.of(0))));
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.FAILED);
+        LabRuntimeFailure runtimeFailure = labs.findRuntimeFailure(lab.id()).orElseThrow();
+        assertThat(runtimeFailure.code()).isEqualTo(LabFailureCode.CONTAINER_EXITED);
+        assertThat(runtimeFailure.service()).contains("app");
+        assertThat(runtimeFailure.safeMessage()).contains("exited unexpectedly");
+        assertThat(engine.resources.keySet()).anyMatch(id -> id.startsWith("volume-"));
+        assertThat(engine.resources.keySet())
+                .noneMatch(id -> id.startsWith("container-") || id.startsWith("network-"));
+        assertThat(first.lab().revision()).isLessThan(second.lab().revision());
+    }
+
+    @Test
+    void aMonitorRegistrationFailureCleansACommittedRun() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("monitor-registration"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        FakeRuntimeMonitor monitor = new FakeRuntimeMonitor();
+        monitor.failRegistration = true;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs, monitor);
+
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), CancellationToken.NONE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("monitor registration");
+
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.FAILED);
+        assertThat(labs.findRuntimeFailure(lab.id()).orElseThrow().code())
+                .isEqualTo(LabFailureCode.CONTAINER_START_FAILED);
+        assertThat(engine.resources.keySet()).anyMatch(id -> id.startsWith("volume-"));
+        assertThat(engine.resources.keySet())
+                .noneMatch(id -> id.startsWith("container-") || id.startsWith("network-"));
+    }
+
+    @Test
+    void aRuntimeOwnershipMismatchFailsWithoutUnverifiedCleanup() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("runtime-ownership"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        FakeRuntimeMonitor monitor = new FakeRuntimeMonitor();
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs, monitor);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        monitor.failureHandler.accept(
+                DockerRuntimeMonitorPort.RuntimeFailure.ownershipChanged());
+
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.FAILED);
+        LabRuntimeFailure failure = labs.findRuntimeFailure(lab.id()).orElseThrow();
+        assertThat(failure.code()).isEqualTo(LabFailureCode.OWNERSHIP_MISMATCH);
+        assertThat(failure.cleanupIncomplete()).isTrue();
+        assertThat(engine.resources.keySet())
+                .anyMatch(id -> id.startsWith("container-"))
+                .anyMatch(id -> id.startsWith("network-"));
+    }
+
+    @Test
+    void unsafeDirectPlanLimitsFailBeforeAnyDockerCall() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("unsafe-direct-plan"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        ManifestPlan safe = plan();
+        ManifestPlan unsafe = new ManifestPlan(
+                safe.schemaVersion(),
+                safe.manifestSha256(),
+                safe.name(),
+                safe.workspaceMount(),
+                new io.labdeck.manifest.LabManifest.ResourceLimits(0, new BigDecimal("2")),
+                safe.services(),
+                safe.images(),
+                safe.builds(),
+                safe.volumes(),
+                safe.tests());
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        assertThatThrownBy(() -> lifecycle.start(lab, unsafe, CancellationToken.NONE))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("memory");
+
+        assertThat(engine.calls).isEmpty();
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.IMPORTED);
+    }
+
     private DockerLabLifecycle lifecycle(
             FakeEngine engine, MemoryJournal journal, MemoryLabRepository labs) {
         AtomicInteger tokens = new AtomicInteger();
@@ -188,6 +396,23 @@ class DockerLabLifecycleTests {
                 new ProjectPathPolicy(),
                 Clock.fixed(NOW, ZoneOffset.UTC),
                 () -> "%032x".formatted(tokens.incrementAndGet()));
+    }
+
+    private DockerLabLifecycle lifecycle(
+            FakeEngine engine,
+            MemoryJournal journal,
+            MemoryLabRepository labs,
+            DockerRuntimeMonitorPort monitor) {
+        AtomicInteger tokens = new AtomicInteger();
+        return new DockerLabLifecycle(
+                engine,
+                journal,
+                labs,
+                new ProjectPathPolicy(),
+                Clock.fixed(NOW, ZoneOffset.UTC),
+                () -> "%032x".formatted(tokens.incrementAndGet()),
+                new DockerReadinessWaiter(),
+                monitor);
     }
 
     private static LabRecord lab(Path workspace) {
@@ -210,18 +435,23 @@ class DockerLabLifecycleTests {
                   app:
                     image: busybox:1.37
                     command: ["sleep", "30"]
+                    healthcheck:
+                      command: ["true"]
                     volumes:
                       - name: course-data
                         target: /data
                   database:
                     image: busybox:1.37
                     command: ["sleep", "30"]
+                    healthcheck:
+                      command: ["true"]
                 """;
         return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
     }
 
     private static final class MemoryLabRepository implements LabRepository {
         private final Map<String, LabRecord> records = new LinkedHashMap<>();
+        private final Map<String, LabRuntimeFailure> failures = new LinkedHashMap<>();
 
         private MemoryLabRepository(LabRecord lab) {
             records.put(lab.id(), lab);
@@ -250,7 +480,30 @@ class DockerLabLifecycleTests {
                 return false;
             }
             records.put(id, current.transitionTo(next, updatedAt));
+            if (next == LabState.STARTING) {
+                failures.remove(id);
+            }
             return true;
+        }
+
+        @Override
+        public boolean compareAndSetStateWithFailure(
+                String id,
+                long expectedRevision,
+                LabState expected,
+                Instant updatedAt,
+                LabRuntimeFailure failure) {
+            if (!compareAndSetState(
+                    id, expectedRevision, expected, LabState.FAILED, updatedAt)) {
+                return false;
+            }
+            failures.put(id, failure);
+            return true;
+        }
+
+        @Override
+        public Optional<LabRuntimeFailure> findRuntimeFailure(String labId) {
+            return Optional.ofNullable(failures.get(labId));
         }
     }
 
@@ -352,9 +605,11 @@ class DockerLabLifecycleTests {
         private boolean failNetworkAfterDispatch;
         private DockerResourceRecord delayedNetwork;
         private Runnable afterStart = () -> {};
+        private DockerHealthStatus healthStatus = DockerHealthStatus.HEALTHY;
+        private boolean containersRunning = true;
 
         void addImage(String reference, String id) {
-            DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of());
+            DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of(), false);
             images.put(reference, metadata);
             images.put(id, metadata);
         }
@@ -362,6 +617,16 @@ class DockerLabLifecycleTests {
         @Override
         public void verifyAvailable() {
             calls.add("ping");
+        }
+
+        @Override
+        public void verifyLocalPortPublishingSupported() {
+            calls.add("verify-ports");
+        }
+
+        @Override
+        public void verifyResourceLimitsSupported() {
+            calls.add("verify-limits");
         }
 
         @Override
@@ -428,16 +693,29 @@ class DockerLabLifecycleTests {
         }
 
         @Override
-        public DockerContainerView inspectContainer(DockerResourceRecord active) {
+        public DockerContainerView inspectContainer(
+                DockerResourceRecord active, DockerContainerSpec specification) {
             String id = active.engineId().orElseThrow();
             requireOwned(id, active);
-            DockerContainerSpec specification = createdSpecifications.get(id);
-            return new DockerContainerView(id, active.logicalName(), specification.image(), "running", true);
+            assertThat(createdSpecifications.get(id)).isEqualTo(specification);
+            return new DockerContainerView(
+                    id,
+                    active.logicalName(),
+                    active.logicalName(),
+                    specification.image(),
+                    containersRunning ? "running" : "exited",
+                    containersRunning,
+                    containersRunning ? java.util.OptionalInt.empty() : java.util.OptionalInt.of(0),
+                    specification.healthCheckRequired() ? healthStatus : DockerHealthStatus.NONE,
+                    List.of());
         }
 
         @Override
-        public void startContainer(DockerResourceRecord active) {
+        public void startContainer(
+                DockerResourceRecord active, DockerContainerSpec specification) {
             requireOwned(active.engineId().orElseThrow(), active);
+            assertThat(createdSpecifications.get(active.engineId().orElseThrow()))
+                    .isEqualTo(specification);
             calls.add("start:" + active.engineId().orElseThrow());
             afterStart.run();
         }
@@ -475,6 +753,35 @@ class DockerLabLifecycleTests {
             if (reserved == null || !reserved.ownershipToken().equals(active.ownershipToken())) {
                 throw new DockerOwnershipException("not owned");
             }
+        }
+    }
+
+    private static final class FakeRuntimeMonitor implements DockerRuntimeMonitorPort {
+        private long runningRevision;
+        private Consumer<RuntimeFailure> failureHandler;
+        private boolean failRegistration;
+
+        @Override
+        public void watch(
+                String labId,
+                long runningRevision,
+                List<DockerReadinessWaiter.ServiceProbe> probes,
+                Consumer<RuntimeFailure> failureHandler) {
+            if (failRegistration) {
+                throw new IllegalStateException("simulated monitor registration failure");
+            }
+            this.runningRevision = runningRevision;
+            this.failureHandler = failureHandler;
+        }
+
+        @Override
+        public void cancel(String labId) {
+            // Preserve the old handler so the stale-revision guard can be tested.
+        }
+
+        @Override
+        public void close() {
+            // No background work.
         }
     }
 }
