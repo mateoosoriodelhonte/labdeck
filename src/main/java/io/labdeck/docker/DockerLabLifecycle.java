@@ -51,6 +51,7 @@ public class DockerLabLifecycle implements AutoCloseable {
     private final DockerRuntimeMonitorPort runtimeMonitor;
     private final ConcurrentHashMap<String, ReentrantLock> labLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ActiveStart> activeStarts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> stopRequests = new ConcurrentHashMap<>();
 
     @Autowired
     public DockerLabLifecycle(
@@ -169,6 +170,9 @@ public class DockerLabLifecycle implements AutoCloseable {
         ActiveStart operation = new ActiveStart(cancellation);
         if (activeStarts.putIfAbsent(requestedLab.id(), operation) != null) {
             throw new IllegalStateException("Another start operation is already active for this lab.");
+        }
+        if (stopRequests.containsKey(requestedLab.id())) {
+            operation.cancel();
         }
         ReentrantLock lock = lockFor(requestedLab.id());
         lock.lock();
@@ -305,62 +309,67 @@ public class DockerLabLifecycle implements AutoCloseable {
         if (labId == null || labId.isBlank()) {
             throw new IllegalArgumentException("The lab ID is required.");
         }
-        runtimeMonitor.cancel(labId);
-        ActiveStart active = activeStarts.get(labId);
-        if (active != null) {
-            active.cancel();
-        }
-        ReentrantLock lock = lockFor(labId);
-        lock.lock();
+        registerStopRequest(labId);
         try {
-            LabRecord current = labs.findById(labId)
-                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
-            LabState cleanupState = current.state();
-            LabRecord stopping = current;
-            if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
-                Instant transitionTime = now();
-                stopping = current.transitionTo(LabState.STOPPING, transitionTime);
-                if (!labs.compareAndSetState(
-                        current.id(), current.revision(), current.state(), LabState.STOPPING, transitionTime)) {
-                    throw new IllegalStateException("Another lab operation won the stop race.");
-                }
-                cleanupState = LabState.STOPPING;
-            } else if (current.state() == LabState.IMPORTED) {
-                Instant transitionTime = now();
-                LabRecord stopped = current.transitionTo(LabState.STOPPED, transitionTime);
-                if (!labs.compareAndSetState(
-                        current.id(), current.revision(), LabState.IMPORTED, LabState.STOPPED, transitionTime)) {
-                    throw new IllegalStateException("Another lab operation won the stop race.");
-                }
-                return stopped;
-            } else if (current.state() == LabState.STOPPED) {
-                return current;
-            } else {
-                throw new IllegalStateException("The lab cannot stop from its current state.");
+            ActiveStart active = activeStarts.get(labId);
+            if (active != null) {
+                active.cancel();
             }
-
-            LabOwnership ownership = new LabOwnership(stopping.id(), stopping.projectId());
+            runtimeMonitor.cancel(labId);
+            ReentrantLock lock = lockFor(labId);
+            lock.lock();
             try {
-                cleanupEphemeralResources(ownership, CancellationToken.NONE);
-                Instant stoppedAt = now();
-                LabRecord stopped = stopping.transitionTo(LabState.STOPPED, stoppedAt);
-                if (!labs.compareAndSetState(
-                        stopping.id(), stopping.revision(), cleanupState, LabState.STOPPED, stoppedAt)) {
-                    throw new IllegalStateException("The stopped lab state could not be stored.");
+                LabRecord current = labs.findById(labId)
+                        .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+                LabState cleanupState = current.state();
+                LabRecord stopping = current;
+                if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
+                    Instant transitionTime = now();
+                    stopping = current.transitionTo(LabState.STOPPING, transitionTime);
+                    if (!labs.compareAndSetState(
+                            current.id(), current.revision(), current.state(), LabState.STOPPING, transitionTime)) {
+                        throw new IllegalStateException("Another lab operation won the stop race.");
+                    }
+                    cleanupState = LabState.STOPPING;
+                } else if (current.state() == LabState.IMPORTED) {
+                    Instant transitionTime = now();
+                    LabRecord stopped = current.transitionTo(LabState.STOPPED, transitionTime);
+                    if (!labs.compareAndSetState(
+                            current.id(), current.revision(), LabState.IMPORTED, LabState.STOPPED, transitionTime)) {
+                        throw new IllegalStateException("Another lab operation won the stop race.");
+                    }
+                    return stopped;
+                } else if (current.state() == LabState.STOPPED) {
+                    return current;
+                } else {
+                    throw new IllegalStateException("The lab cannot stop from its current state.");
                 }
-                return stopped;
-            } catch (RuntimeException failure) {
-                if (cleanupState == LabState.STOPPING) {
-                    storeFailure(
-                            stopping,
-                            LabFailureCode.CLEANUP_INCOMPLETE,
-                            Optional.empty(),
-                            true);
+
+                LabOwnership ownership = new LabOwnership(stopping.id(), stopping.projectId());
+                try {
+                    cleanupEphemeralResources(ownership, CancellationToken.NONE);
+                    Instant stoppedAt = now();
+                    LabRecord stopped = stopping.transitionTo(LabState.STOPPED, stoppedAt);
+                    if (!labs.compareAndSetState(
+                            stopping.id(), stopping.revision(), cleanupState, LabState.STOPPED, stoppedAt)) {
+                        throw new IllegalStateException("The stopped lab state could not be stored.");
+                    }
+                    return stopped;
+                } catch (RuntimeException failure) {
+                    if (cleanupState == LabState.STOPPING) {
+                        storeFailure(
+                                stopping,
+                                LabFailureCode.CLEANUP_INCOMPLETE,
+                                Optional.empty(),
+                                true);
+                    }
+                    throw failure;
                 }
-                throw failure;
+            } finally {
+                unlock(lock);
             }
         } finally {
-            unlock(lock);
+            clearStopRequest(labId);
         }
     }
 
@@ -890,6 +899,14 @@ public class DockerLabLifecycle implements AutoCloseable {
 
     private ReentrantLock lockFor(String labId) {
         return labLocks.computeIfAbsent(labId, ignored -> new ReentrantLock());
+    }
+
+    private void registerStopRequest(String labId) {
+        stopRequests.merge(labId, 1, (current, added) -> Math.addExact(current, added));
+    }
+
+    private void clearStopRequest(String labId) {
+        stopRequests.computeIfPresent(labId, (ignored, count) -> count == 1 ? null : count - 1);
     }
 
     private void unlock(ReentrantLock lock) {

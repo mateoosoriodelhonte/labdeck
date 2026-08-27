@@ -10,6 +10,7 @@ import io.labdeck.lab.LabState;
 import java.time.Instant;
 import java.util.Optional;
 import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -135,6 +136,38 @@ class SQLiteLabRuntimeFailureTests {
         }
     }
 
+    @Test
+    void upgradesAnExistingV3FailureDatabaseWithoutChangingItsChecksum() {
+        java.nio.file.Path dataDirectory = temporaryDirectory.resolve("v3-upgrade-data");
+        try (LockedSQLiteDataSource dataSource = openAtV3(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            labs.create(lab());
+            storeInitialFailure(labs);
+            assertThat(labs.findRuntimeFailure("lab-a").orElseThrow().code())
+                    .isEqualTo(LabFailureCode.HEALTHCHECK_UNHEALTHY);
+        }
+
+        try (LockedSQLiteDataSource dataSource = open(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            assertThat(labs.findRuntimeFailure("lab-a").orElseThrow().code())
+                    .isEqualTo(LabFailureCode.HEALTHCHECK_UNHEALTHY);
+            assertThat(labs.compareAndSetState(
+                    "lab-a", 3, LabState.FAILED, LabState.STARTING, CREATED.plusSeconds(4))).isTrue();
+            assertThat(labs.compareAndSetState(
+                    "lab-a", 4, LabState.STARTING, LabState.STOPPING, CREATED.plusSeconds(5))).isTrue();
+            LabRuntimeFailure storageFailure = new LabRuntimeFailure(
+                    "lab-a",
+                    6,
+                    LabFailureCode.DOCKER_STORAGE_FULL,
+                    Optional.empty(),
+                    CREATED.plusSeconds(6),
+                    false);
+            assertThat(labs.compareAndSetStateWithFailure(
+                    "lab-a", 5, LabState.STOPPING, CREATED.plusSeconds(6), storageFailure)).isTrue();
+            assertThat(labs.findRuntimeFailure("lab-a")).contains(storageFailure);
+        }
+    }
+
     private static void storeInitialFailure(SQLiteLabRepository labs) {
         assertThat(labs.compareAndSetState(
                 "lab-a", 0, LabState.IMPORTED, LabState.STARTING, CREATED.plusSeconds(1))).isTrue();
@@ -166,12 +199,26 @@ class SQLiteLabRuntimeFailureTests {
 
     private static LockedSQLiteDataSource open(java.nio.file.Path dataDirectory) {
         LockedSQLiteDataSource dataSource = new SQLiteDataSourceFactory().create(dataDirectory);
-        Flyway.configure()
+        Flyway flyway = Flyway.configure()
                 .dataSource(dataSource)
                 .locations("classpath:db/migration")
                 .cleanDisabled(true)
-                .load()
-                .migrate();
+                .load();
+        flyway.migrate();
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+        return dataSource;
+    }
+
+    private static LockedSQLiteDataSource openAtV3(java.nio.file.Path dataDirectory) {
+        LockedSQLiteDataSource dataSource = new SQLiteDataSourceFactory().create(dataDirectory);
+        Flyway flyway = Flyway.configure()
+                .dataSource(dataSource)
+                .locations("classpath:db/migration")
+                .target(MigrationVersion.fromVersion("3"))
+                .cleanDisabled(true)
+                .load();
+        flyway.migrate();
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
         return dataSource;
     }
 }

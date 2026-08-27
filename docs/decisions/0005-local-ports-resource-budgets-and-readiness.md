@@ -55,9 +55,10 @@ Engine inspection, including the final full snapshot. Unknown image-health timin
 After Running, poll exact journaled container IDs every two seconds. An exit or unhealthy state
 claims the exact running revision, cleans verified ephemeral resources, and stores a safe failure.
 Three Docker inspection failures store a Docker-unavailable state without cleanup. An ownership
-mismatch also fails without unverified cleanup. Startup cancellation signals the readiness loop
-before it waits for the per-lab lifecycle lock. One synchronized gate decides whether cancellation
-or the final Running commit wins.
+mismatch also fails without unverified cleanup. A reference-counted per-lab stop request covers the
+gap between a stop lookup and a concurrent start registration. Startup cancellation signals the
+readiness loop before it waits for the per-lab lifecycle lock. One synchronized gate decides
+whether cancellation or the final Running commit wins.
 
 Translate confirmed image-pull failures to fixed messages without raw registry or daemon text.
 Recognize Docker storage exhaustion only from narrow `ENOSPC` or `no space left on device` evidence.

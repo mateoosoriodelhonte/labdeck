@@ -232,6 +232,39 @@ class DockerLabLifecycleTests {
     }
 
     @Test
+    void stopRequestCancelsAStartThatRegistersAfterTheActiveStartLookup() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("stop-registration-race"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        FakeRuntimeMonitor monitor = new FakeRuntimeMonitor();
+        monitor.blockCancellation();
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs, monitor);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<LabRecord> stop = executor.submit(() -> lifecycle.stop(lab.id()));
+            try {
+                assertThat(monitor.awaitCancellation()).isTrue();
+
+                Future<?> start = executor.submit(() -> lifecycle.start(lab, plan(), CancellationToken.NONE));
+
+                assertThatThrownBy(() -> start.get(2, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class)
+                        .hasCauseInstanceOf(DockerOperationCancelledException.class);
+                assertThat(engine.calls).isEmpty();
+            } finally {
+                monitor.releaseCancellation();
+            }
+
+            assertThat(stop.get(2, TimeUnit.SECONDS).state()).isEqualTo(LabState.STOPPED);
+            assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+            assertThat(engine.resources).isEmpty();
+        }
+    }
+
+    @Test
     void cancellationThatWinsTheRunningCommitGateCannotReportSuccess() throws Exception {
         Path workspace = Files.createDirectories(temporaryDirectory.resolve("cancel-at-commit"));
         LabRecord lab = lab(workspace);
@@ -932,6 +965,21 @@ class DockerLabLifecycleTests {
         private long runningRevision;
         private Consumer<RuntimeFailure> failureHandler;
         private boolean failRegistration;
+        private boolean blockCancellation;
+        private final CountDownLatch cancellationEntered = new CountDownLatch(1);
+        private final CountDownLatch cancellationReleased = new CountDownLatch(1);
+
+        private void blockCancellation() {
+            blockCancellation = true;
+        }
+
+        private boolean awaitCancellation() throws InterruptedException {
+            return cancellationEntered.await(2, TimeUnit.SECONDS);
+        }
+
+        private void releaseCancellation() {
+            cancellationReleased.countDown();
+        }
 
         @Override
         public void watch(
@@ -948,6 +996,17 @@ class DockerLabLifecycleTests {
 
         @Override
         public void cancel(String labId) {
+            if (blockCancellation) {
+                cancellationEntered.countDown();
+                try {
+                    if (!cancellationReleased.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("The test monitor cancellation was not released.");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("The test monitor cancellation was interrupted.", exception);
+                }
+            }
             // Preserve the old handler so the stale-revision guard can be tested.
         }
 
