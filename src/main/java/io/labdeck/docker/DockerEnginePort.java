@@ -28,6 +28,8 @@ public interface DockerEnginePort {
     DockerContainerView inspectContainer(
             DockerResourceRecord active, DockerContainerSpec specification);
 
+    DockerContainerView inspectContainerSnapshot(DockerResourceRecord active);
+
     void startContainer(DockerResourceRecord active, DockerContainerSpec specification);
 
     void stopContainer(DockerResourceRecord active, Duration timeout);

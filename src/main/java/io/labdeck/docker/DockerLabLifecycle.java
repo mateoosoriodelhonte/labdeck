@@ -306,6 +306,17 @@ public class DockerLabLifecycle implements AutoCloseable {
     }
 
     public LabRecord stop(String labId) {
+        return stop(labId, null);
+    }
+
+    public LabRecord stop(String labId, long expectedRevision) {
+        if (expectedRevision < 0) {
+            throw new IllegalArgumentException("The expected lab revision is not valid.");
+        }
+        return stop(labId, Long.valueOf(expectedRevision));
+    }
+
+    private LabRecord stop(String labId, Long expectedRevision) {
         if (labId == null || labId.isBlank()) {
             throw new IllegalArgumentException("The lab ID is required.");
         }
@@ -321,6 +332,9 @@ public class DockerLabLifecycle implements AutoCloseable {
             try {
                 LabRecord current = labs.findById(labId)
                         .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+                if (expectedRevision != null && current.revision() != expectedRevision.longValue()) {
+                    throw new IllegalStateException("The lab changed before the stop operation began.");
+                }
                 LabState cleanupState = current.state();
                 LabRecord stopping = current;
                 if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
@@ -370,6 +384,34 @@ public class DockerLabLifecycle implements AutoCloseable {
             }
         } finally {
             clearStopRequest(labId);
+        }
+    }
+
+    public List<DockerContainerView> inspectServices(String labId) {
+        if (labId == null || !labId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+            throw new IllegalArgumentException("The lab ID is not valid.");
+        }
+        ReentrantLock lock = lockFor(labId);
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            if (!Set.of(LabState.RUNNING, LabState.FAILED).contains(current.state())) {
+                return List.of();
+            }
+            LabOwnership ownership = new LabOwnership(current.id(), current.projectId());
+            List<DockerResourceRecord> containers = journal.findOpenByLab(ownership).stream()
+                    .filter(resource -> resource.type() == DockerResourceType.CONTAINER)
+                    .filter(resource -> resource.state() == DockerResourceState.ACTIVE)
+                    .sorted(java.util.Comparator.comparing(DockerResourceRecord::logicalName))
+                    .toList();
+            if (containers.isEmpty()) {
+                return List.of();
+            }
+            engine.verifyAvailable();
+            return containers.stream().map(engine::inspectContainerSnapshot).toList();
+        } finally {
+            unlock(lock);
         }
     }
 

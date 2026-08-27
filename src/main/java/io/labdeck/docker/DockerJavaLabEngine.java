@@ -363,6 +363,25 @@ public class DockerJavaLabEngine implements DockerEnginePort {
     }
 
     @Override
+    public DockerContainerView inspectContainerSnapshot(DockerResourceRecord active) {
+        requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        InspectContainerResponse inspection = inspectOwnedContainer(active);
+        var state = inspection.getState();
+        String status = state == null || state.getStatus() == null ? "unknown" : state.getStatus();
+        boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+        OptionalInt exitCode = !running && state != null && state.getExitCodeLong() != null
+                ? OptionalInt.of(Math.toIntExact(state.getExitCodeLong()))
+                : OptionalInt.empty();
+        DockerHealthStatus health = healthStatus(state == null ? null : state.getHealth());
+        String name = inspection.getName() == null ? "" : inspection.getName().replaceFirst("^/", "");
+        String image = inspection.getConfig() == null || inspection.getConfig().getImage() == null
+                ? "unknown" : inspection.getConfig().getImage();
+        return new DockerContainerView(
+                inspection.getId(), active.logicalName(), name, image, status, running,
+                exitCode, health, inspectSnapshotPublishedPorts(inspection));
+    }
+
+    @Override
     public void startContainer(
             DockerResourceRecord active, DockerContainerSpec specification) {
         requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
@@ -693,6 +712,45 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             }
             mappings.add(new DockerPortMapping(
                     expectedPort.containerPort(), binding.getHostIp(), hostPort, expectedPort.protocol()));
+        }
+        return mappings.stream()
+                .sorted(java.util.Comparator.comparingInt(DockerPortMapping::containerPort))
+                .toList();
+    }
+
+    private static List<DockerPortMapping> inspectSnapshotPublishedPorts(
+            InspectContainerResponse actual) {
+        if (actual.getNetworkSettings() == null || actual.getNetworkSettings().getPorts() == null) {
+            return List.of();
+        }
+        Map<ExposedPort, Ports.Binding[]> bindings = actual.getNetworkSettings().getPorts().getBindings();
+        if (bindings == null || bindings.isEmpty()) {
+            return List.of();
+        }
+        List<DockerPortMapping> mappings = new ArrayList<>();
+        for (Map.Entry<ExposedPort, Ports.Binding[]> entry : bindings.entrySet()) {
+            ExposedPort exposed = entry.getKey();
+            Ports.Binding[] published = entry.getValue();
+            if (published == null || published.length == 0) {
+                continue;
+            }
+            if (exposed == null
+                    || !ExposedPort.tcp(exposed.getPort()).equals(exposed)
+                    || published.length != 1) {
+                throw new DockerOwnershipException("Docker reported an unsupported host port mapping.");
+            }
+            Ports.Binding binding = published[0];
+            if (binding == null) {
+                throw new DockerOwnershipException("Docker reported an empty host port mapping.");
+            }
+            int hostPort;
+            try {
+                hostPort = Integer.parseInt(binding.getHostPortSpec());
+            } catch (NumberFormatException exception) {
+                throw new DockerOwnershipException("Docker did not report a valid host port.", exception);
+            }
+            mappings.add(new DockerPortMapping(
+                    exposed.getPort(), binding.getHostIp(), hostPort, "tcp"));
         }
         return mappings.stream()
                 .sorted(java.util.Comparator.comparingInt(DockerPortMapping::containerPort))

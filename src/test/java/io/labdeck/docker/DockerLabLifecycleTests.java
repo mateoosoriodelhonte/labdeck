@@ -100,6 +100,54 @@ class DockerLabLifecycleTests {
     }
 
     @Test
+    void inspectsOnlyActiveContainersJournaledToTheSelectedRunningLab() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("inspect-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        List<DockerContainerView> services = lifecycle.inspectServices(lab.id());
+
+        assertThat(services).extracting(DockerContainerView::service)
+                .containsExactly("app", "database");
+        assertThat(services).allSatisfy(service -> {
+            assertThat(service.running()).isTrue();
+            assertThat(service.id()).startsWith("container-");
+        });
+        int callsBeforeMissingLab = engine.calls.size();
+        assertThatThrownBy(() -> lifecycle.inspectServices("missing-lab"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("does not exist");
+        assertThat(engine.calls).hasSize(callsBeforeMissingLab);
+    }
+
+    @Test
+    void stopRejectsAStaleExpectedRevisionBeforeChangingResources() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("revision-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+        int callsBeforeStop = engine.calls.size();
+
+        assertThatThrownBy(() -> lifecycle.stop(lab.id(), 0))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("changed");
+        assertThat(engine.calls).hasSize(callsBeforeStop);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.RUNNING);
+
+        LabRecord stopped = lifecycle.stop(lab.id(), started.lab().revision());
+        assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+    }
+
+    @Test
     void missingImagesRequireConfirmationBeforeAnyLifecycleMutation() throws Exception {
         Path workspace = Files.createDirectories(temporaryDirectory.resolve("workspace"));
         LabRecord lab = lab(workspace);
@@ -860,6 +908,16 @@ class DockerLabLifecycleTests {
                     List.of());
             afterInspect.run();
             return view;
+        }
+
+        @Override
+        public DockerContainerView inspectContainerSnapshot(DockerResourceRecord active) {
+            String id = active.engineId().orElseThrow();
+            DockerContainerSpec specification = createdSpecifications.get(id);
+            if (specification == null) {
+                throw new IllegalStateException("No container specification is available.");
+            }
+            return inspectContainer(active, specification);
         }
 
         @Override

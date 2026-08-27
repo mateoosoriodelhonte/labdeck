@@ -163,6 +163,6 @@ class LocalApiSecurityTests {
     }
 
     private String token(MvcResult result) throws Exception {
-        return json.readTree(result.getResponse().getContentAsByteArray()).get("token").asText();
+        return json.readTree(result.getResponse().getContentAsString()).get("token").asText();
     }
 }
