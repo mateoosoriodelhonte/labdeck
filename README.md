@@ -7,8 +7,9 @@ less time fighting dependencies and more time working on the assignment.
 
 > [!NOTE]
 > LabDeck is under active v1 development. The current bootstrap serves a tested Vue application
-> from one local Spring Boot process. Docker lab creation is tracked in the v1 milestone and is not
-> claimed as complete yet.
+> from one local Spring Boot process. The guarded Docker lifecycle is implemented behind the domain
+> port. The user-facing start flow, ports, health readiness, and resource limits are still tracked
+> in the v1 milestone and are not claimed as complete yet.
 
 ## What works now
 
@@ -17,6 +18,9 @@ less time fighting dependencies and more time working on the assignment.
 - Versioned `GET /api/v1/system` status contract.
 - Closed v1 manifest schema, bounded YAML parser, semantic validator, and deterministic plan.
 - Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
+- Public-image inspection and confirmed pulls without Docker registry credentials.
+- Journaled Docker containers, private networks, persistent-volume identity, and exact cleanup.
+- Workspace identity checks before structured bind mounts; no general Docker prune operations.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.
 - Unit, contract, build, and browser smoke checks for the bootstrap.
@@ -89,7 +93,8 @@ resource controls, and persistent workspaces are the product.
 Architecture decisions are recorded in
 [ADR-0001](docs/decisions/0001-local-modular-monolith.md) and
 [ADR-0002](docs/decisions/0002-restricted-manifest.md), and
-[ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md).
+[ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md), and
+[ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md).
 
 ## Safety and privacy
 
@@ -117,3 +122,7 @@ The public v1 plan is in [issue #1](https://github.com/mateoosoriodelhonte/labde
 The bootstrap work is tracked in [issue #2](https://github.com/mateoosoriodelhonte/labdeck/issues/2).
 Restricted manifest work is tracked in
 [issue #3](https://github.com/mateoosoriodelhonte/labdeck/issues/3).
+SQLite persistence is tracked in
+[issue #4](https://github.com/mateoosoriodelhonte/labdeck/issues/4).
+Docker lifecycle and ownership are tracked in
+[issue #5](https://github.com/mateoosoriodelhonte/labdeck/issues/5).

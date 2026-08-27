@@ -54,7 +54,7 @@ ports:
 
 Omit `host` to request a free local port. LabDeck always binds published ports to `127.0.0.1`. V1 accepts TCP only. An explicit host port must be from 1024 through 65535.
 
-Volumes are LabDeck-managed named volumes. V1 does not accept bind mounts. A volume cannot target `/`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/run`, `/sys`, or `/var/run`.
+Volumes are LabDeck-managed named volumes. V1 does not accept bind mounts. A volume cannot target `/`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/run`, `/sys`, or `/var/run`. A named volume also cannot equal, contain, or sit inside the approved workspace mount. This prevents a volume from hiding student files.
 
 Resource limits apply to every service. If `resources` is absent, LabDeck uses 1 GB of memory and 2 CPUs. Memory must be from 64 MiB through 8 GiB. CPU must be from 0.25 through 8.
 
