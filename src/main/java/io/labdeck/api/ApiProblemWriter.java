@@ -31,6 +31,7 @@ public final class ApiProblemWriter {
         problem.put("title", title);
         problem.put("status", status);
         problem.put("detail", detail);
+        problem.put("instance", "/api/v1");
         problem.put("code", code);
         response.resetBuffer();
         response.setStatus(status);

@@ -97,5 +97,6 @@ API models keep the public contract smaller and safer.
 - The API shows the selected workspace path because the local user must verify the mount. Problems
   and list summaries do not repeat it.
 - Remote access needs a separate authentication, authorization, origin, proxy, TLS, and threat
-  model. Changing only `server.address` cannot enable it.
+  model. The startup guard also rejects a separate management port and any non-local management
+  address. Changing server properties cannot enable remote access.
 - Logs, test execution, and templates remain explicitly incomplete until issues #8, #9, and #10.

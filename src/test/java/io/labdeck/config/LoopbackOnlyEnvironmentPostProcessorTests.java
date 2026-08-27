@@ -25,7 +25,25 @@ class LoopbackOnlyEnvironmentPostProcessorTests {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessage("LabDeck must bind to 127.0.0.1. Remote server addresses are not supported.");
         }
-        assertThatThrownBy(() -> process(null)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> process((String) null)).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void rejectsASeparateOrRemoteManagementListener() {
+        assertThatCode(() -> process(Map.of(
+                        "server.address", "127.0.0.1",
+                        "management.server.address", "127.0.0.1")))
+                .doesNotThrowAnyException();
+        assertThatThrownBy(() -> process(Map.of(
+                        "server.address", "127.0.0.1",
+                        "management.server.address", "0.0.0.0")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("LabDeck management endpoints must use 127.0.0.1. Remote addresses are not supported.");
+        assertThatThrownBy(() -> process(Map.of(
+                        "server.address", "127.0.0.1",
+                        "management.server.port", "8788")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("LabDeck management endpoints must use the main local server port.");
     }
 
     @Test
@@ -42,9 +60,15 @@ class LoopbackOnlyEnvironmentPostProcessorTests {
     private void process(String address) {
         StandardEnvironment environment = new StandardEnvironment();
         if (address != null) {
-            environment.getPropertySources().addFirst(
-                    new MapPropertySource("test", Map.of("server.address", address)));
+            process(Map.of("server.address", address));
+            return;
         }
+        processor.postProcessEnvironment(environment, null);
+    }
+
+    private void process(Map<String, Object> properties) {
+        StandardEnvironment environment = new StandardEnvironment();
+        environment.getPropertySources().addFirst(new MapPropertySource("test", properties));
         processor.postProcessEnvironment(environment, null);
     }
 }

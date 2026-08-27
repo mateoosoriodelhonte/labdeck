@@ -18,6 +18,7 @@ import io.labdeck.api.LabApiModels.ManifestPlanResponse;
 import io.labdeck.api.LabApiModels.ResourcePlanResponse;
 import io.labdeck.api.LabApiModels.SettingsResponse;
 import io.labdeck.api.LabApiModels.TemplateListResponse;
+import io.labdeck.docker.DockerEngineCapabilityException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -153,11 +154,52 @@ class LabControllerContractTests {
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+        mvc.perform(post("/api/v1/labs/lab-1/start")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "expectedRevision": null,
+                                  "expectedManifestSha256":
+                                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                  "confirmedImageDownloads": []
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
         mvc.perform(post("/api/v1/labs/lab-1/stop")
                         .session(csrf.session())
                         .header(csrf.header(), csrf.token())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"expectedRevision\":-1}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+        mvc.perform(post("/api/v1/labs/lab-1/stop")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expectedRevision\":null}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+        mvc.perform(post("/api/v1/labs/lab-1/start")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "expectedManifestSha256":
+                                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                  "confirmedImageDownloads": []
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
+        mvc.perform(post("/api/v1/labs/lab-1/stop")
+                        .session(csrf.session())
+                        .header(csrf.header(), csrf.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
         verifyNoInteractions(labs);
@@ -186,6 +228,20 @@ class LabControllerContractTests {
                 .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
     }
 
+    @Test
+    void returnsActionableTypedDockerCapabilityProblems() throws Exception {
+        when(labs.getLab("lab-1")).thenThrow(new DockerEngineCapabilityException(
+                DockerEngineCapabilityException.Reason.UNAVAILABLE));
+
+        mvc.perform(get("/api/v1/labs/lab-1"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("DOCKER_UNAVAILABLE"))
+                .andExpect(jsonPath("$.instance").value("/api/v1"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Docker is not available. Install or start Docker, then retry."));
+    }
+
     private void assertMalformed(CsrfSession csrf, String body) throws Exception {
         mvc.perform(post("/api/v1/labs")
                         .session(csrf.session())
@@ -199,8 +255,9 @@ class LabControllerContractTests {
 
     private CsrfSession csrf() throws Exception {
         MvcResult bootstrap = mvc.perform(get("/api/v1/csrf")).andExpect(status().isOk()).andReturn();
-        String token = json.readTree(bootstrap.getResponse().getContentAsString()).get("token").asText();
-        String header = json.readTree(bootstrap.getResponse().getContentAsString()).get("headerName").asText();
+        String token = json.readTree(bootstrap.getResponse().getContentAsString()).get("token").stringValue();
+        String header = json.readTree(bootstrap.getResponse().getContentAsString())
+                .get("headerName").stringValue();
         return new CsrfSession(
                 (MockHttpSession) bootstrap.getRequest().getSession(false), header, token);
     }

@@ -9,13 +9,17 @@ import static org.mockito.Mockito.when;
 
 import io.labdeck.api.LabApiModels.StartLabRequest;
 import io.labdeck.docker.CancellationToken;
+import io.labdeck.docker.DockerContainerView;
+import io.labdeck.docker.DockerHealthStatus;
 import io.labdeck.docker.DockerImagePlan;
 import io.labdeck.docker.DockerLabLifecycle;
+import io.labdeck.docker.DockerServiceSnapshot;
 import io.labdeck.docker.DockerStartResult;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
 import io.labdeck.lab.LabState;
 import io.labdeck.lab.TestRunRepository;
+import io.labdeck.manifest.ApprovedWorkspacePath;
 import io.labdeck.manifest.ManifestPlan;
 import io.labdeck.manifest.ManifestPlanCompiler;
 import io.labdeck.manifest.ManifestProblem;
@@ -32,6 +36,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,6 +54,7 @@ class LabApiServiceTests {
     private LabApiService service;
     private LabRecord lab;
     private ManifestPlan plan;
+    private ApprovedWorkspacePath approvedWorkspace;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -63,8 +69,8 @@ class LabApiServiceTests {
         manifests = mock(WorkspaceManifestLoader.class);
         when(labs.findById(lab.id())).thenReturn(Optional.of(lab));
         when(labs.findRuntimeFailure(lab.id())).thenReturn(Optional.empty());
-        when(manifests.load(workspace)).thenReturn(new LoadedManifest(
-                new ProjectPathPolicy().resolveWorkspace(workspace), plan));
+        approvedWorkspace = new ProjectPathPolicy().resolveWorkspace(workspace);
+        when(manifests.load(workspace)).thenReturn(new LoadedManifest(approvedWorkspace, plan));
         service = new LabApiService(
                 labs,
                 tests,
@@ -77,7 +83,7 @@ class LabApiServiceTests {
     @Test
     void requiresTheCurrentRevisionAndManifestHashBeforeDockerInspection() {
         assertThatThrownBy(() -> service.startLab(
-                        lab.id(), new StartLabRequest(1, plan.manifestSha256(), List.of())))
+                        lab.id(), new StartLabRequest(1L, plan.manifestSha256(), List.of())))
                 .isInstanceOfSatisfying(ApiException.class, exception -> {
                     assertThat(exception.code()).isEqualTo("LAB_REVISION_CHANGED");
                     assertThat(exception.properties()).containsEntry("currentRevision", 0L);
@@ -86,7 +92,7 @@ class LabApiServiceTests {
 
         assertThatThrownBy(() -> service.startLab(
                         lab.id(), new StartLabRequest(
-                                0,
+                                0L,
                                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                                 List.of())))
                 .isInstanceOfSatisfying(ApiException.class, exception ->
@@ -100,14 +106,15 @@ class LabApiServiceTests {
                 new DockerImagePlan("busybox:1.37", Optional.empty())));
 
         assertThatThrownBy(() -> service.startLab(
-                        lab.id(), new StartLabRequest(0, plan.manifestSha256(), List.of())))
+                        lab.id(), new StartLabRequest(0L, plan.manifestSha256(), List.of())))
                 .isInstanceOfSatisfying(ApiException.class, exception -> {
                     assertThat(exception.code()).isEqualTo("IMAGE_CONFIRMATION_REQUIRED");
                     assertThat(exception.properties()).containsKey("images");
                 });
         verify(lifecycle, never()).pullConfirmedImages(
                 plan, List.of("busybox:1.37"), CancellationToken.NONE);
-        verify(lifecycle, never()).start(lab, plan, CancellationToken.NONE);
+        verify(lifecycle, never()).start(
+                lab, approvedWorkspace, plan, CancellationToken.NONE);
     }
 
     @Test
@@ -117,15 +124,18 @@ class LabApiServiceTests {
         LabRecord running = new LabRecord(
                 lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
                 LabState.RUNNING, 2, lab.createdAt(), NOW.plusSeconds(2));
-        when(lifecycle.start(lab, plan, CancellationToken.NONE)).thenReturn(new DockerStartResult(
-                running, "network-id", List.of(), List.of()));
+        when(lifecycle.start(
+                        lab, approvedWorkspace, plan, CancellationToken.NONE))
+                .thenReturn(new DockerStartResult(
+                        running, "network-id", List.of(), List.of()));
 
         var response = service.startLab(
-                lab.id(), new StartLabRequest(0, plan.manifestSha256(), List.of("busybox:1.37")));
+                lab.id(), new StartLabRequest(0L, plan.manifestSha256(), List.of("busybox:1.37")));
 
         verify(lifecycle).pullConfirmedImages(
                 plan, List.of("busybox:1.37"), CancellationToken.NONE);
-        verify(lifecycle).start(lab, plan, CancellationToken.NONE);
+        verify(lifecycle).start(
+                lab, approvedWorkspace, plan, CancellationToken.NONE);
         assertThat(response.lab().state()).isEqualTo("RUNNING");
         assertThat(response.lab().revision()).isEqualTo(2);
     }
@@ -148,6 +158,37 @@ class LabApiServiceTests {
         assertThat(response.state()).isEqualTo("STOPPED");
         assertThat(response.revision()).isEqualTo(1);
         assertThat(response.plan()).isNull();
+    }
+
+    @Test
+    void serviceInspectionDoesNotDependOnTheMutableManifestOrExposeImageIds() {
+        LabRecord running = new LabRecord(
+                lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
+                LabState.RUNNING, 2, lab.createdAt(), NOW.plusSeconds(2));
+        when(labs.findById(lab.id())).thenReturn(Optional.of(running));
+        when(manifests.load(lab.workspace())).thenThrow(new AssertionError(
+                "Service inspection must not read the mutable manifest."));
+        when(lifecycle.inspectServiceSnapshot(lab.id())).thenReturn(new DockerServiceSnapshot(
+                running,
+                List.of(new DockerContainerView(
+                        "private-engine-id",
+                        "app",
+                        "private-generated-name",
+                        "sha256:private-image-id",
+                        "running",
+                        true,
+                        OptionalInt.empty(),
+                        DockerHealthStatus.HEALTHY,
+                        List.of()))));
+
+        var response = service.listServices(lab.id());
+
+        assertThat(response.services()).singleElement().satisfies(container -> {
+            assertThat(container.service()).isEqualTo("app");
+            assertThat(container.image()).isEqualTo("unavailable");
+            assertThat(container.status()).isEqualTo("running");
+        });
+        assertThat(response.revision()).isEqualTo(2);
     }
 
     private static String manifest() {

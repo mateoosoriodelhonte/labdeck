@@ -63,36 +63,58 @@ public class DockerJavaLabEngine implements DockerEnginePort {
 
     @Override
     public void verifyAvailable() {
-        docker.pingCmd().exec();
+        try {
+            docker.pingCmd().exec();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
+        }
     }
 
     @Override
     public void verifyLocalPortPublishingSupported() {
-        String version = docker.versionCmd().exec().getVersion();
+        String version;
+        try {
+            version = docker.versionCmd().exec().getVersion();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
+        }
         int separator = version == null ? -1 : version.indexOf('.');
         if (separator < 1) {
-            throw new IllegalStateException("Docker did not report a supported Engine version.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
         int major;
         try {
             major = Integer.parseInt(version.substring(0, separator));
         } catch (NumberFormatException exception) {
-            throw new IllegalStateException("Docker did not report a supported Engine version.", exception);
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
         if (major < 28) {
-            throw new IllegalStateException(
-                    "Published localhost ports require Docker Engine 28 or newer. Update the local Docker engine.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
     }
 
     @Override
     public void verifyResourceLimitsSupported() {
-        var info = docker.infoCmd().exec();
+        var info = dockerInfo();
         if (!Boolean.TRUE.equals(info.getMemoryLimit())
                 || !Boolean.TRUE.equals(info.getSwapLimit())
                 || !Boolean.TRUE.equals(info.getCpuCfsQuota())) {
-            throw new IllegalStateException(
-                    "The local Docker engine does not support the required memory, swap, and CPU limits.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.RESOURCE_LIMITS_UNSUPPORTED);
+        }
+    }
+
+    private com.github.dockerjava.api.model.Info dockerInfo() {
+        try {
+            return docker.infoCmd().exec();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
         }
     }
 

@@ -16,6 +16,15 @@ public final class LoopbackOnlyEnvironmentPostProcessor implements EnvironmentPo
             throw new IllegalStateException(
                     "LabDeck must bind to 127.0.0.1. Remote server addresses are not supported.");
         }
+        String managementAddress = environment.getProperty("management.server.address");
+        if (managementAddress != null && !REQUIRED_ADDRESS.equals(managementAddress)) {
+            throw new IllegalStateException(
+                    "LabDeck management endpoints must use 127.0.0.1. Remote addresses are not supported.");
+        }
+        if (environment.getProperty("management.server.port") != null) {
+            throw new IllegalStateException(
+                    "LabDeck management endpoints must use the main local server port.");
+        }
     }
 
     @Override

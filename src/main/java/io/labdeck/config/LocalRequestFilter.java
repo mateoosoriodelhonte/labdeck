@@ -34,7 +34,9 @@ public final class LocalRequestFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain) throws ServletException, IOException {
         String authority = localAuthority(request);
-        if (authority == null || hasForwardedHeader(request)) {
+        if (!"127.0.0.1".equals(request.getRemoteAddr())
+                || authority == null
+                || hasForwardedHeader(request)) {
             problems.write(
                     response,
                     HttpServletResponse.SC_BAD_REQUEST,

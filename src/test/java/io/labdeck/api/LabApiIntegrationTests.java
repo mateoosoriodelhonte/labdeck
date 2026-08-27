@@ -67,7 +67,7 @@ class LabApiIntegrationTests {
         String body = imported.getResponse().getContentAsString();
         assertThat(body).doesNotContain(SECRET_VALUE);
         JsonNode importedJson = json.readTree(body);
-        String id = importedJson.get("id").asText();
+        String id = importedJson.get("id").stringValue();
 
         mvc.perform(get("/api/v1/labs"))
                 .andExpect(status().isOk())
@@ -116,8 +116,8 @@ class LabApiIntegrationTests {
         JsonNode response = json.readTree(bootstrap.getResponse().getContentAsString());
         return new CsrfSession(
                 (MockHttpSession) bootstrap.getRequest().getSession(false),
-                response.get("headerName").asText(),
-                response.get("token").asText());
+                response.get("headerName").stringValue(),
+                response.get("token").stringValue());
     }
 
     private static String manifest() {

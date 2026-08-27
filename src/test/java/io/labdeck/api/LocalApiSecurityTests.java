@@ -112,7 +112,17 @@ class LocalApiSecurityTests {
     void rejectsHostileAuthorityOriginAndProxyIdentity() throws Exception {
         mvc.perform(get("/api/v1/csrf").header(HttpHeaders.HOST, "evil.example:8787"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("LOCAL_REQUEST_REQUIRED"));
+                .andExpect(jsonPath("$.code").value("LOCAL_REQUEST_REQUIRED"))
+                .andExpect(jsonPath("$.instance").value("/api/v1"));
+        mvc.perform(get("/api/v1/csrf")
+                        .with(request -> {
+                            request.setRemoteAddr("192.0.2.10");
+                            return request;
+                        })
+                        .header(HttpHeaders.HOST, "127.0.0.1:8787"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("LOCAL_REQUEST_REQUIRED"))
+                .andExpect(jsonPath("$.instance").value("/api/v1"));
         mvc.perform(get("/api/v1/csrf").header(HttpHeaders.HOST, "localhost", "127.0.0.1"))
                 .andExpect(status().isBadRequest());
         mvc.perform(get("/api/v1/csrf")
@@ -163,6 +173,6 @@ class LocalApiSecurityTests {
     }
 
     private String token(MvcResult result) throws Exception {
-        return json.readTree(result.getResponse().getContentAsString()).get("token").asText();
+        return json.readTree(result.getResponse().getContentAsString()).get("token").stringValue();
     }
 }

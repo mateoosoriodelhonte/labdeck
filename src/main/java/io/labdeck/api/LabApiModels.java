@@ -1,6 +1,7 @@
 package io.labdeck.api;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
@@ -17,7 +18,7 @@ public final class LabApiModels {
             @NotBlank @Size(max = 4096) String workspace) {}
 
     public record StartLabRequest(
-            @PositiveOrZero long expectedRevision,
+            @NotNull @PositiveOrZero Long expectedRevision,
             @NotBlank
             @Pattern(regexp = "sha256:[a-f0-9]{64}")
             String expectedManifestSha256,
@@ -31,7 +32,7 @@ public final class LabApiModels {
         }
     }
 
-    public record StopLabRequest(@PositiveOrZero long expectedRevision) {}
+    public record StopLabRequest(@NotNull @PositiveOrZero Long expectedRevision) {}
 
     public record LabListResponse(String apiVersion, List<LabSummaryResponse> labs) {
         public LabListResponse {

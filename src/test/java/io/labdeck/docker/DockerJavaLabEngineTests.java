@@ -60,6 +60,24 @@ class DockerJavaLabEngineTests {
     }
 
     @Test
+    void translatesAnUnavailableDaemonWithoutExposingRawConnectionText() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        when(docker.pingCmd()).thenThrow(new IllegalStateException(
+                "connect failed at /private/docker.sock"));
+        DockerJavaLabEngine engine = new DockerJavaLabEngine(docker, http);
+
+        assertThatThrownBy(engine::verifyAvailable)
+                .isInstanceOfSatisfying(DockerEngineCapabilityException.class, failure -> {
+                    assertThat(failure.reason())
+                            .isEqualTo(DockerEngineCapabilityException.Reason.UNAVAILABLE);
+                    assertThat(failure.getMessage()).contains("Install or start Docker");
+                    assertThat(failure.getMessage()).doesNotContain("/private/docker.sock");
+                    assertThat(failure.getCause()).isNull();
+                });
+    }
+
+    @Test
     void translatesRegistryPullFailuresWithoutExposingRawDaemonText() {
         DockerClient docker = mock(DockerClient.class);
         DockerHttpClient http = mock(DockerHttpClient.class);

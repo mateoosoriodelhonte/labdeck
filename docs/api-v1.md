@@ -12,8 +12,9 @@ forwarded identity headers. An `Origin` header, when present, must match the req
 authority. LabDeck sends no cross-origin permission headers. These checks limit DNS rebinding and
 cross-site requests, but they do not make the service safe for a public network.
 
-The process fails during startup if `server.address` is not exactly `127.0.0.1`. This rule also
-applies to command-line and environment overrides.
+The process fails during startup if `server.address` is not exactly `127.0.0.1`, if a separate
+management port is set, or if a management address is not `127.0.0.1`. The request peer must also
+be `127.0.0.1`. These rules apply to command-line and environment overrides.
 
 ## Request verification
 
@@ -107,6 +108,11 @@ IDs and Engine-generated names. Published ports have `hostAddress: 127.0.0.1` an
 as `127.0.0.1:5432`. The endpoint has no forced URL scheme because a service can use PostgreSQL,
 Redis, HTTP, or another TCP protocol.
 
+The live service list captures the lab revision and exact-owned containers under one lifecycle
+lock. It does not reload the mutable manifest. Its `image` value is `unavailable` until LabDeck
+stores a safe immutable display reference. This avoids showing a changed manifest reference or a
+private Docker image ID as if it described the running container.
+
 ## Stop a lab
 
 Request:
@@ -160,6 +166,9 @@ Common codes include:
 | `409` | `DOCKER_OWNERSHIP_MISMATCH` | Stored and actual Docker ownership do not match |
 | `415` | `JSON_REQUIRED` | A mutation did not use JSON |
 | `422` | `MANIFEST_INVALID` | The restricted manifest failed validation |
+| `503` | `DOCKER_UNAVAILABLE` | Install or start the local Docker engine |
+| `503` | `DOCKER_VERSION_UNSUPPORTED` | Update Docker Engine for safe local port publishing |
+| `503` | `DOCKER_RESOURCE_LIMITS_UNSUPPORTED` | Docker cannot enforce the required resource limits |
 | `507` | `DOCKER_STORAGE_FULL` | Docker storage is full; LabDeck did not prune it |
 
 ## Browser policy

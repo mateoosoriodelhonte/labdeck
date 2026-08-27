@@ -27,6 +27,7 @@ import io.labdeck.docker.CancellationToken;
 import io.labdeck.docker.DockerContainerView;
 import io.labdeck.docker.DockerImagePlan;
 import io.labdeck.docker.DockerLabLifecycle;
+import io.labdeck.docker.DockerServiceSnapshot;
 import io.labdeck.docker.DockerStartResult;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
@@ -151,7 +152,8 @@ public class LabApiService {
         Objects.requireNonNull(request, "request");
         LabRecord lab = findLab(id);
         requireRevision(lab, request.expectedRevision());
-        ManifestPlan plan = loadPlan(lab);
+        LoadedManifest loaded = loadManifest(lab);
+        ManifestPlan plan = loaded.plan();
         if (!plan.manifestSha256().equals(request.expectedManifestSha256())) {
             throw conflict(
                     "MANIFEST_CHANGED",
@@ -187,7 +189,8 @@ public class LabApiService {
             lifecycle.pullConfirmedImages(plan, missing, CancellationToken.NONE);
         }
 
-        DockerStartResult result = lifecycle.start(lab, plan, CancellationToken.NONE);
+        DockerStartResult result = lifecycle.start(
+                lab, loaded.workspace(), plan, CancellationToken.NONE);
         Map<String, String> images = plan.services().stream().collect(Collectors.toUnmodifiableMap(
                 service -> service.id(),
                 service -> sourceLabel(service.definition().source())));
@@ -213,16 +216,13 @@ public class LabApiService {
     }
 
     public ServiceListResponse listServices(String id) {
-        LabRecord lab = findLab(id);
-        ManifestPlan plan = loadPlan(lab);
-        Map<String, String> images = plan.services().stream().collect(Collectors.toUnmodifiableMap(
-                service -> service.id(),
-                service -> sourceLabel(service.definition().source())));
-        List<ServiceStatusResponse> services = lifecycle.inspectServices(id).stream()
-                .map(container -> service(container, images.getOrDefault(container.service(), "unknown")))
+        findLab(id);
+        DockerServiceSnapshot snapshot = lifecycle.inspectServiceSnapshot(id);
+        List<ServiceStatusResponse> services = snapshot.services().stream()
+                .map(container -> service(container, "unavailable"))
                 .toList();
-        LabRecord current = findLab(id);
-        return new ServiceListResponse(API_VERSION, current.id(), current.revision(), services);
+        return new ServiceListResponse(
+                API_VERSION, snapshot.lab().id(), snapshot.lab().revision(), services);
     }
 
     public TestHistoryResponse testHistory(String id, int limit) {
@@ -264,6 +264,10 @@ public class LabApiService {
     }
 
     private ManifestPlan loadPlan(LabRecord lab) {
+        return loadManifest(lab).plan();
+    }
+
+    private LoadedManifest loadManifest(LabRecord lab) {
         LoadedManifest loaded = manifests.load(lab.workspace());
         if (!loaded.workspace().path().equals(lab.workspace())) {
             throw conflict(
@@ -272,7 +276,7 @@ public class LabApiService {
                     "The stored workspace no longer has the approved identity.",
                     Map.of());
         }
-        return loaded.plan();
+        return loaded;
     }
 
     private LabDetailResponse detail(LabRecord lab, ManifestPlan plan) {

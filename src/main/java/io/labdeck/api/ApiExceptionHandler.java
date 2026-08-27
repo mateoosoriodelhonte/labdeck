@@ -1,5 +1,6 @@
 package io.labdeck.api;
 
+import io.labdeck.docker.DockerEngineCapabilityException;
 import io.labdeck.docker.DockerImagePullException;
 import io.labdeck.docker.DockerImagesRequiredException;
 import io.labdeck.docker.DockerOperationCancelledException;
@@ -154,6 +155,21 @@ public class ApiExceptionHandler {
                 "Image confirmation required",
                 exception.getMessage(),
                 Map.of("images", exception.missingImages()));
+    }
+
+    @ExceptionHandler(DockerEngineCapabilityException.class)
+    ResponseEntity<ProblemDetail> dockerCapability(DockerEngineCapabilityException exception) {
+        String title = switch (exception.reason()) {
+            case UNAVAILABLE -> "Docker is not available";
+            case VERSION_UNSUPPORTED -> "Docker version is not supported";
+            case RESOURCE_LIMITS_UNSUPPORTED -> "Docker resource limits are not supported";
+        };
+        return problem(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "DOCKER_" + exception.reason().name(),
+                title,
+                exception.getMessage(),
+                Map.of());
     }
 
     @ExceptionHandler(DockerImagePullException.class)
