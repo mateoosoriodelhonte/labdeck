@@ -63,36 +63,58 @@ public class DockerJavaLabEngine implements DockerEnginePort {
 
     @Override
     public void verifyAvailable() {
-        docker.pingCmd().exec();
+        try {
+            docker.pingCmd().exec();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
+        }
     }
 
     @Override
     public void verifyLocalPortPublishingSupported() {
-        String version = docker.versionCmd().exec().getVersion();
+        String version;
+        try {
+            version = docker.versionCmd().exec().getVersion();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
+        }
         int separator = version == null ? -1 : version.indexOf('.');
         if (separator < 1) {
-            throw new IllegalStateException("Docker did not report a supported Engine version.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
         int major;
         try {
             major = Integer.parseInt(version.substring(0, separator));
         } catch (NumberFormatException exception) {
-            throw new IllegalStateException("Docker did not report a supported Engine version.", exception);
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
         if (major < 28) {
-            throw new IllegalStateException(
-                    "Published localhost ports require Docker Engine 28 or newer. Update the local Docker engine.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.VERSION_UNSUPPORTED);
         }
     }
 
     @Override
     public void verifyResourceLimitsSupported() {
-        var info = docker.infoCmd().exec();
+        var info = dockerInfo();
         if (!Boolean.TRUE.equals(info.getMemoryLimit())
                 || !Boolean.TRUE.equals(info.getSwapLimit())
                 || !Boolean.TRUE.equals(info.getCpuCfsQuota())) {
-            throw new IllegalStateException(
-                    "The local Docker engine does not support the required memory, swap, and CPU limits.");
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.RESOURCE_LIMITS_UNSUPPORTED);
+        }
+    }
+
+    private com.github.dockerjava.api.model.Info dockerInfo() {
+        try {
+            return docker.infoCmd().exec();
+        } catch (RuntimeException failure) {
+            throw new DockerEngineCapabilityException(
+                    DockerEngineCapabilityException.Reason.UNAVAILABLE);
         }
     }
 
@@ -360,6 +382,25 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         return new DockerContainerView(
                 inspection.getId(), active.logicalName(), name, image, status, running,
                 exitCode, health, inspectPublishedPorts(inspection, specification));
+    }
+
+    @Override
+    public DockerContainerView inspectContainerSnapshot(DockerResourceRecord active) {
+        requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        InspectContainerResponse inspection = inspectOwnedContainer(active);
+        var state = inspection.getState();
+        String status = state == null || state.getStatus() == null ? "unknown" : state.getStatus();
+        boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+        OptionalInt exitCode = !running && state != null && state.getExitCodeLong() != null
+                ? OptionalInt.of(Math.toIntExact(state.getExitCodeLong()))
+                : OptionalInt.empty();
+        DockerHealthStatus health = healthStatus(state == null ? null : state.getHealth());
+        String name = inspection.getName() == null ? "" : inspection.getName().replaceFirst("^/", "");
+        String image = inspection.getConfig() == null || inspection.getConfig().getImage() == null
+                ? "unknown" : inspection.getConfig().getImage();
+        return new DockerContainerView(
+                inspection.getId(), active.logicalName(), name, image, status, running,
+                exitCode, health, inspectSnapshotPublishedPorts(inspection));
     }
 
     @Override
@@ -693,6 +734,45 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             }
             mappings.add(new DockerPortMapping(
                     expectedPort.containerPort(), binding.getHostIp(), hostPort, expectedPort.protocol()));
+        }
+        return mappings.stream()
+                .sorted(java.util.Comparator.comparingInt(DockerPortMapping::containerPort))
+                .toList();
+    }
+
+    private static List<DockerPortMapping> inspectSnapshotPublishedPorts(
+            InspectContainerResponse actual) {
+        if (actual.getNetworkSettings() == null || actual.getNetworkSettings().getPorts() == null) {
+            return List.of();
+        }
+        Map<ExposedPort, Ports.Binding[]> bindings = actual.getNetworkSettings().getPorts().getBindings();
+        if (bindings == null || bindings.isEmpty()) {
+            return List.of();
+        }
+        List<DockerPortMapping> mappings = new ArrayList<>();
+        for (Map.Entry<ExposedPort, Ports.Binding[]> entry : bindings.entrySet()) {
+            ExposedPort exposed = entry.getKey();
+            Ports.Binding[] published = entry.getValue();
+            if (published == null || published.length == 0) {
+                continue;
+            }
+            if (exposed == null
+                    || !ExposedPort.tcp(exposed.getPort()).equals(exposed)
+                    || published.length != 1) {
+                throw new DockerOwnershipException("Docker reported an unsupported host port mapping.");
+            }
+            Ports.Binding binding = published[0];
+            if (binding == null) {
+                throw new DockerOwnershipException("Docker reported an empty host port mapping.");
+            }
+            int hostPort;
+            try {
+                hostPort = Integer.parseInt(binding.getHostPortSpec());
+            } catch (NumberFormatException exception) {
+                throw new DockerOwnershipException("Docker did not report a valid host port.", exception);
+            }
+            mappings.add(new DockerPortMapping(
+                    exposed.getPort(), binding.getHostIp(), hostPort, "tcp"));
         }
         return mappings.stream()
                 .sorted(java.util.Comparator.comparingInt(DockerPortMapping::containerPort))

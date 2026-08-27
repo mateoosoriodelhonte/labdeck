@@ -146,6 +146,9 @@ class DockerJavaLabEngineIntegrationTests {
                     .isFalse();
             assertThat(docker.inspectVolumeCmd(volume.engineId().orElseThrow()).exec().getLabels())
                     .containsAllEntriesOf(volume.labels());
+            assertThat(lifecycle.inspectServices(labId))
+                    .usingRecursiveComparison()
+                    .isEqualTo(started.containers());
 
             LabRecord stopped = lifecycle.stop(labId);
 

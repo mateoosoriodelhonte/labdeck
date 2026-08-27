@@ -1,6 +1,21 @@
 spring:
   application:
     name: labdeck
+  jackson:
+    deserialization:
+      fail-on-trailing-tokens: true
+      fail-on-unknown-properties: true
+    factory:
+      constraints:
+        read:
+          max-document-length: 65536
+          max-name-length: 128
+          max-nesting-depth: 20
+          max-number-length: 64
+          max-string-length: 8192
+          max-token-count: 10000
+    read:
+      strict-duplicate-detection: true
   flyway:
     baseline-on-migrate: false
     clean-disabled: true
@@ -12,13 +27,28 @@ labdeck:
 
 server:
   address: 127.0.0.1
+  forward-headers-strategy: none
+  max-http-request-header-size: 8KB
   port: ${LABDECK_PORT:8787}
   error:
     include-message: never
     include-stacktrace: never
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        same-site: strict
+  tomcat:
+    max-http-form-post-size: 64KB
+    max-parameter-count: 64
+    max-part-count: 0
+    max-swallow-size: 64KB
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health
+  endpoint:
+    health:
+      show-details: never

@@ -8,6 +8,7 @@ import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
 import io.labdeck.lab.LabRuntimeFailure;
 import io.labdeck.lab.LabState;
+import io.labdeck.manifest.ApprovedWorkspacePath;
 import io.labdeck.manifest.ManifestPlan;
 import io.labdeck.manifest.ManifestPlanCompiler;
 import io.labdeck.manifest.ProjectPathPolicy;
@@ -97,6 +98,56 @@ class DockerLabLifecycleTests {
                 "remove:container-app",
                 "remove:network-lab-network",
                 "verify:volume-course-data");
+    }
+
+    @Test
+    void inspectsOnlyActiveContainersJournaledToTheSelectedRunningLab() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("inspect-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerServiceSnapshot snapshot = lifecycle.inspectServiceSnapshot(lab.id());
+        List<DockerContainerView> services = snapshot.services();
+
+        assertThat(snapshot.lab().revision()).isEqualTo(2);
+        assertThat(services).extracting(DockerContainerView::service)
+                .containsExactly("app", "database");
+        assertThat(services).allSatisfy(service -> {
+            assertThat(service.running()).isTrue();
+            assertThat(service.id()).startsWith("container-");
+        });
+        int callsBeforeMissingLab = engine.calls.size();
+        assertThatThrownBy(() -> lifecycle.inspectServiceSnapshot("missing-lab"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("does not exist");
+        assertThat(engine.calls).hasSize(callsBeforeMissingLab);
+    }
+
+    @Test
+    void stopRejectsAStaleExpectedRevisionBeforeChangingResources() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("revision-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+        int callsBeforeStop = engine.calls.size();
+
+        assertThatThrownBy(() -> lifecycle.stop(lab.id(), 0))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("changed");
+        assertThat(engine.calls).hasSize(callsBeforeStop);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.RUNNING);
+
+        LabRecord stopped = lifecycle.stop(lab.id(), started.lab().revision());
+        assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
     }
 
     @Test
@@ -521,6 +572,29 @@ class DockerLabLifecycleTests {
         assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.IMPORTED);
     }
 
+    @Test
+    void rejectsAWorkspaceIdentitySwapAfterManifestReview() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("reviewed-workspace"));
+        ApprovedWorkspacePath approved = new ProjectPathPolicy().resolveWorkspace(workspace);
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        Files.move(workspace, temporaryDirectory.resolve("original-workspace"));
+        Files.createDirectory(workspace);
+
+        assertThatThrownBy(() -> lifecycle.start(
+                        lab, approved, plan(), CancellationToken.NONE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("approved workspace changed");
+
+        assertThat(engine.calls).isEmpty();
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.IMPORTED);
+        assertThat(journal.findOpenByLab(new LabOwnership(lab.id(), lab.projectId()))).isEmpty();
+    }
+
     private DockerLabLifecycle lifecycle(
             FakeEngine engine, MemoryJournal journal, MemoryLabRepository labs) {
         AtomicInteger tokens = new AtomicInteger();
@@ -860,6 +934,16 @@ class DockerLabLifecycleTests {
                     List.of());
             afterInspect.run();
             return view;
+        }
+
+        @Override
+        public DockerContainerView inspectContainerSnapshot(DockerResourceRecord active) {
+            String id = active.engineId().orElseThrow();
+            DockerContainerSpec specification = createdSpecifications.get(id);
+            if (specification == null) {
+                throw new IllegalStateException("No container specification is available.");
+            }
+            return inspectContainer(active, specification);
         }
 
         @Override
