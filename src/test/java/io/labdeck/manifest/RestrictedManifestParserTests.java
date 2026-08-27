@@ -85,6 +85,22 @@ class RestrictedManifestParserTests {
     }
 
     @Test
+    void allowsAnEnvChildToReceiveALiteralSplitStringFlag() {
+        LabManifest manifest = parser.parse(minimalManifest("""
+                services:
+                  app:
+                    image: busybox:1.37
+                tests:
+                  service: app
+                  command: ["env", "printf", "-S"]
+                  timeout: 5s
+                """));
+
+        assertThat(manifest.tests().orElseThrow().command())
+                .containsExactly("env", "printf", "-S");
+    }
+
+    @Test
     void rejectsOneFixedHostPortRequestedByTwoServices() {
         String yaml = minimalManifest("""
                 services:
@@ -297,6 +313,27 @@ class RestrictedManifestParserTests {
                 unsafeServiceField("shell string", "command: \"sleep infinity\"",
                         ManifestProblemCode.MANIFEST_VALUE_TYPE_INVALID, "/services/app/command"),
                 unsafeServiceField("shell wrapper", "command: [\"sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("absolute shell wrapper",
+                        "command: [\"/usr/bin/sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("busybox shell wrapper",
+                        "command: [\"busybox\", \"sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("env shell wrapper",
+                        "command: [\"env\", \"MODE=test\", \"sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("env numeric assignment shell wrapper",
+                        "command: [\"env\", \"1=x\", \"sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("absolute env busybox shell wrapper",
+                        "command: [\"/usr/bin/env\", \"--\", \"busybox\", \"sh\", \"-c\", \"echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("env split string shell wrapper",
+                        "command: [\"env\", \"-S\", \"sh -c echo unsafe\"]",
+                        ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
+                unsafeServiceField("busybox env shell wrapper",
+                        "command: [\"busybox\", \"env\", \"sh\", \"-c\", \"echo unsafe\"]",
                         ManifestProblemCode.MANIFEST_SHELL_COMMAND_FORBIDDEN, "/services/app/command"),
                 unsafeServiceField("bad host port", "ports: [{container: 8000, host: 0}]",
                         ManifestProblemCode.MANIFEST_PORT_POLICY_VIOLATION, "/services/app/ports/0/host"),

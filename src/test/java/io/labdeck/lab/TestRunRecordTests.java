@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 class TestRunRecordTests {
 
+    private static final String PLAN_SHA256 = "sha256:" + "a".repeat(64);
     private static final TestOutputSanitizer SANITIZER =
             TestOutputSanitizer.forLab(Path.of("/tmp/test-workspace"), List.of());
 
@@ -20,8 +21,12 @@ class TestRunRecordTests {
         TestRunRecord result = TestRunRecord.bounded(
                 "run-1",
                 "lab-1",
+                2,
+                "app",
+                PLAN_SHA256,
                 Instant.ofEpochMilli(1_000),
                 TestStatus.ERROR,
+                TestOutcomeReason.DOCKER_ERROR,
                 Duration.ofSeconds(2),
                 OptionalInt.empty(),
                 SANITIZER,
@@ -53,8 +58,12 @@ class TestRunRecordTests {
         assertThatThrownBy(() -> new TestRunRecord(
                         "run-1",
                         "lab-1",
+                        2,
+                        "app",
+                        PLAN_SHA256,
                         Instant.EPOCH,
                         TestStatus.ERROR,
+                        TestOutcomeReason.DOCKER_ERROR,
                         Duration.ZERO,
                         OptionalInt.empty(),
                         first,
@@ -68,8 +77,12 @@ class TestRunRecordTests {
         assertThatThrownBy(() -> TestRunRecord.bounded(
                         "run-1",
                         "lab-1",
+                        2,
+                        "app",
+                        PLAN_SHA256,
                         Instant.MAX,
                         TestStatus.ERROR,
+                        TestOutcomeReason.DOCKER_ERROR,
                         Duration.ZERO,
                         OptionalInt.empty(),
                         SANITIZER,
@@ -79,16 +92,67 @@ class TestRunRecordTests {
                 .hasMessageContaining("storage range");
     }
 
+    @Test
+    void acceptsLegacyResultsOnlyWithTheMigrationSentinel() {
+        assertThatThrownBy(() -> TestRunRecord.bounded(
+                        "run-1",
+                        "lab-1",
+                        2,
+                        "app",
+                        PLAN_SHA256,
+                        Instant.EPOCH,
+                        TestStatus.PASSED,
+                        TestOutcomeReason.LEGACY,
+                        Duration.ZERO,
+                        OptionalInt.of(0),
+                        SANITIZER,
+                        "",
+                        ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("migration sentinel");
+
+        TestRunRecord migrated = TestRunRecord.bounded(
+                "run-1",
+                "lab-1",
+                0,
+                "legacy",
+                "sha256:" + "0".repeat(64),
+                Instant.EPOCH,
+                TestStatus.PASSED,
+                TestOutcomeReason.LEGACY,
+                Duration.ZERO,
+                OptionalInt.of(0),
+                SANITIZER,
+                "",
+                "");
+
+        assertThat(migrated.outcomeReason()).isEqualTo(TestOutcomeReason.LEGACY);
+    }
+
     private static TestRunRecord result(TestStatus status, OptionalInt exitCode) {
         return TestRunRecord.bounded(
                 "run-1",
                 "lab-1",
+                2,
+                "app",
+                PLAN_SHA256,
                 Instant.EPOCH,
                 status,
+                reason(status),
                 Duration.ZERO,
                 exitCode,
                 SANITIZER,
                 "",
                 "");
+    }
+
+    private static TestOutcomeReason reason(TestStatus status) {
+        return switch (status) {
+            case PASSED -> TestOutcomeReason.EXIT_ZERO;
+            case FAILED -> TestOutcomeReason.NON_ZERO_EXIT;
+            case ERROR -> TestOutcomeReason.DOCKER_ERROR;
+            case CANCELLED -> TestOutcomeReason.USER_CANCELLED;
+            case TIMED_OUT -> TestOutcomeReason.TIMEOUT;
+        };
     }
 }

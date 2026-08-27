@@ -55,13 +55,14 @@ class StoredOutputTests {
 
     @Test
     void scrubsKnownAndPatternBasedCredentialsBeforePersistence() {
-        String raw = "password=hunter2 token:abc123 " + CREDENTIAL + " " + WORKSPACE;
+        String raw = "password=hunter2 token:abc123 " + CREDENTIAL + " " + WORKSPACE
+                + "\u001b[31m\u202esecret";
 
         StoredOutput output = StoredOutput.bounded(raw, StoredOutput.MAX_UTF8_BYTES, SANITIZER);
 
         assertThat(output.text())
                 .contains("password=[REDACTED]", "token:[REDACTED]")
-                .doesNotContain("hunter2", "abc123", CREDENTIAL, WORKSPACE.toString());
+                .doesNotContain("hunter2", "abc123", CREDENTIAL, WORKSPACE.toString(), "\u001b", "\u202e");
         assertThat(output.safeToPersist()).isTrue();
         assertThat(output.toString()).doesNotContain(raw, CREDENTIAL, "hunter2");
     }

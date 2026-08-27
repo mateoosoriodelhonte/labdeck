@@ -58,14 +58,15 @@ has the form `sha256:` followed by 64 lowercase hexadecimal characters.
 | `GET` | `/labs/{id}/services` | Bounded status, metrics, topology, storage, and cleanup plan for exact-owned resources |
 | `GET` | `/labs/{id}/logs?service=app&tail=200` | Bounded log history for one active exact-owned service |
 | `GET` | `/labs/{id}/logs/stream?service=app&tail=100` | Bounded server-sent log stream for one active exact-owned service |
-| `GET` | `/labs/{id}/tests?limit=20` | Recent bounded test results; limit is 1 through 100 |
+| `GET` | `/labs/{id}/tests?limit=20` | Recent bounded results and the current process-local run; limit is 1 through 100 |
+| `POST` | `/labs/{id}/tests` | Start the reviewed manifest-defined assignment test |
+| `GET` | `/labs/{id}/tests/{runId}` | Read active or terminal test status |
+| `POST` | `/labs/{id}/tests/{runId}/cancel` | Cancel the active test and stop its exact lab |
 | `GET` | `/templates` | Typed placeholder with `capability: PLANNED` until issue #10 |
 | `GET` | `/settings` | Read-only local security and capability settings |
 
-Test execution is not part of this issue. Issue #9 will add the constrained mutation that runs
-only the manifest-defined argv inside an owned service. The current `/tests` contract is read-only
-history. Templates remain `PLANNED` instead of returning invented data. Settings report logs as
-`AVAILABLE`.
+Templates remain `PLANNED` instead of returning invented data. Settings report logs and assignment
+test execution as `AVAILABLE`.
 
 ## Import a lab
 
@@ -159,6 +160,57 @@ list or prune operation. The response can contain `plan: null` when the manifest
 The stopped state and new revision still return, so a successful cleanup is not reported as a
 failed stop.
 
+## Run an assignment test
+
+First read `GET /labs/{id}` and show the manifest test plan. Then send:
+
+```json
+{
+  "expectedRevision": 2,
+  "expectedManifestSha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+No other fields are accepted. The request cannot supply a command, service, environment, timeout,
+or working directory. LabDeck checks that the lab is Running, the revision and manifest are current,
+and the manifest matches the plan held in memory from the successful lab start. A LabDeck restart or
+manifest change requires a lab restart before test execution.
+
+A successful start returns `202 Accepted`, `Cache-Control: no-store`, a `Location` header for the
+run status, and a `RUNNING` body. Poll that location until the status is terminal. Process-local
+status can be `RUNNING`, `CANCELLING`, or `PERSISTING`. Terminal status is `PASSED`, `FAILED`,
+`ERROR`, `CANCELLED`, or
+`TIMED_OUT` and includes a stable outcome reason, duration, optional exit code, separate output,
+per-stream truncation, lab revision, service, and nonsecret test-plan digest.
+
+`GET /labs/{id}/tests` returns `runs` and a nullable `activeRun`. The client uses `activeRun` to
+restore polling and cancellation after a page reload. It can also contain a terminal `ERROR` with
+`RESULT_UNAVAILABLE` when the result could not be saved and the slot remains reserved. Each saved
+history row includes its full nonsecret test-plan digest and recorded time.
+
+LabDeck sends the manifest command as direct Docker argv inside the exact active owned service. It
+adds no shell, stdin, TTY, privilege, environment override, or browser-provided value. One test can
+run per lab and two can run per process. LabDeck does not queue a third test.
+
+The Docker stream capture is limited to 128 KiB. Stored standard output and error are sanitized and
+limited to 64 KiB combined. Redaction covers the workspace, all manifest environment values, common
+credential assignments, bearer tokens, and unsafe control characters. This is defense in depth; no
+generic filter can prove that arbitrary test output contains no secret. History keeps at most 100
+results per lab and 1,000 in total.
+
+Cancel with an exact empty JSON body:
+
+```json
+{}
+```
+
+Docker Engine cannot kill only one exec process. A user cancel, timeout, or ambiguous exec error
+therefore stops and cleans the exact selected lab. The UI tells the student to restart it. LabDeck
+reports `CANCELLED` or `TIMED_OUT` only after scoped cleanup succeeds. If cleanup cannot be proved,
+the result is `ERROR` with reason `RESULT_UNAVAILABLE`. If SQLite cannot save a terminal result,
+LabDeck keeps an in-memory `RESULT_UNAVAILABLE` result and keeps the test slot reserved until the
+process restarts. A proved natural test exit leaves the lab running.
+
 ## Problem details
 
 Errors use `application/problem+json` and RFC 9457 fields plus a stable `code`:
@@ -193,13 +245,17 @@ Common codes include:
 | `409` | `MANIFEST_CHANGED` | The manifest plan hash changed |
 | `409` | `IMAGE_CONFIRMATION_REQUIRED` | Public images need explicit confirmation |
 | `409` | `DOCKER_OWNERSHIP_MISMATCH` | Stored and actual Docker ownership do not match |
+| `409` | `TEST_ALREADY_RUNNING` | The selected lab already has an active test |
+| `409` | `TEST_RESTART_REQUIRED` | Restart the lab after a manifest or application change |
 | `404` | `LAB_SERVICE_NOT_ACTIVE` | The selected service is not active in the selected lab |
 | `415` | `JSON_REQUIRED` | A mutation did not use JSON |
 | `422` | `MANIFEST_INVALID` | The restricted manifest failed validation |
 | `429` | `LOG_STREAM_LIMIT_REACHED` | The local log stream bound is already in use |
+| `429` | `TEST_PROCESS_LIMIT_REACHED` | Two assignment tests are already active |
 | `502` | `DOCKER_LOGS_UNAVAILABLE` | Docker could not provide the selected service logs safely |
 | `503` | `DOCKER_UNAVAILABLE` | Install or start the local Docker engine |
 | `503` | `LOG_STREAM_UNAVAILABLE` | The bounded local stream worker is unavailable |
+| `503` | `TEST_RUNNER_UNAVAILABLE` | The bounded test worker is unavailable |
 | `503` | `DOCKER_VERSION_UNSUPPORTED` | Update Docker Engine for safe local port publishing |
 | `503` | `DOCKER_RESOURCE_LIMITS_UNSUPPORTED` | Docker cannot enforce the required resource limits |
 | `504` | `DOCKER_OBSERVATION_TIMEOUT` | Docker observation exceeded the five-second deadline |

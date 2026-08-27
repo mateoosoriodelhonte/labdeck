@@ -8,6 +8,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.labdeck.api.LabApiModels.StartLabRequest;
+import io.labdeck.api.LabApiModels.RunTestsRequest;
 import io.labdeck.docker.CancellationToken;
 import io.labdeck.docker.DockerContainerView;
 import io.labdeck.docker.DockerContainerMetrics;
@@ -20,7 +21,9 @@ import io.labdeck.docker.DockerStartResult;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
 import io.labdeck.lab.LabState;
+import io.labdeck.lab.LabTestRunService;
 import io.labdeck.lab.TestRunRepository;
+import io.labdeck.lab.TestRunSnapshot;
 import io.labdeck.manifest.ApprovedWorkspacePath;
 import io.labdeck.manifest.ManifestPlan;
 import io.labdeck.manifest.ManifestPlanCompiler;
@@ -53,6 +56,7 @@ class LabApiServiceTests {
 
     private LabRepository labs;
     private DockerLabLifecycle lifecycle;
+    private LabTestRunService testRuns;
     private WorkspaceManifestLoader manifests;
     private LabApiService service;
     private LabRecord lab;
@@ -74,11 +78,13 @@ class LabApiServiceTests {
         when(labs.findRuntimeFailure(lab.id())).thenReturn(Optional.empty());
         approvedWorkspace = new ProjectPathPolicy().resolveWorkspace(workspace);
         when(manifests.load(workspace)).thenReturn(new LoadedManifest(approvedWorkspace, plan));
+        testRuns = mock(LabTestRunService.class);
         service = new LabApiService(
                 labs,
                 tests,
                 manifests,
                 lifecycle,
+                testRuns,
                 Clock.fixed(NOW, ZoneOffset.UTC),
                 () -> "fixed-id");
     }
@@ -247,6 +253,68 @@ class LabApiServiceTests {
         assertThat(response.revision()).isEqualTo(2);
     }
 
+    @Test
+    void startsOnlyTheCurrentRunningManifestTestPlan() {
+        LabRecord running = new LabRecord(
+                lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
+                LabState.RUNNING, 2, lab.createdAt(), NOW.plusSeconds(2));
+        when(labs.findById(lab.id())).thenReturn(Optional.of(running));
+        TestRunSnapshot snapshot = new TestRunSnapshot(
+                "test-1",
+                lab.id(),
+                2,
+                "app",
+                "sha256:" + "b".repeat(64),
+                NOW,
+                null,
+                "RUNNING",
+                null,
+                0,
+                null,
+                "",
+                "",
+                false,
+                false,
+                true);
+        when(testRuns.start(running, plan)).thenReturn(snapshot);
+
+        var response = service.startTest(
+                lab.id(), new RunTestsRequest(2L, plan.manifestSha256()));
+
+        verify(lifecycle).validateTestStart(running, plan);
+        verify(testRuns).start(running, plan);
+        assertThat(response.status()).isEqualTo("RUNNING");
+        assertThat(response.testPlanSha256()).isEqualTo("sha256:" + "b".repeat(64));
+    }
+
+    @Test
+    void includesTheCurrentRunInTestHistoryForPageRecovery() {
+        TestRunSnapshot snapshot = new TestRunSnapshot(
+                "test-1",
+                lab.id(),
+                2,
+                "app",
+                "sha256:" + "b".repeat(64),
+                NOW,
+                null,
+                "RUNNING",
+                null,
+                25,
+                null,
+                "",
+                "",
+                false,
+                false,
+                true);
+        when(testRuns.findActive(lab.id())).thenReturn(Optional.of(snapshot));
+
+        var response = service.testHistory(lab.id(), 20);
+
+        assertThat(response.activeRun()).isNotNull();
+        assertThat(response.activeRun().id()).isEqualTo("test-1");
+        assertThat(response.activeRun().canCancel()).isTrue();
+    }
+
     private static String manifest() {
         return """
                 version: 1
@@ -259,6 +327,10 @@ class LabApiServiceTests {
                 resources:
                   memory: 256MiB
                   cpus: 0.5
+                tests:
+                  service: app
+                  command: ["true"]
+                  timeout: 5s
                 """;
     }
 }

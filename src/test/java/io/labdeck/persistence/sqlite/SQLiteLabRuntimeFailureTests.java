@@ -205,7 +205,7 @@ class SQLiteLabRuntimeFailureTests {
                 .cleanDisabled(true)
                 .load();
         flyway.migrate();
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("5");
         return dataSource;
     }
 

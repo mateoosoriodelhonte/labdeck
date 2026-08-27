@@ -8,6 +8,7 @@ import io.labdeck.lab.LabState;
 import io.labdeck.lab.StoredOutput;
 import io.labdeck.lab.TestRunRecord;
 import io.labdeck.lab.TestOutputSanitizer;
+import io.labdeck.lab.TestOutcomeReason;
 import io.labdeck.lab.TestStatus;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileStore;
@@ -20,6 +21,7 @@ import java.util.List;
 import java.util.OptionalInt;
 import java.util.Set;
 import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.dao.DataAccessException;
@@ -27,6 +29,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 class SQLitePersistenceIntegrationTests {
 
+    private static final String TEST_PLAN_SHA256 = "sha256:" + "a".repeat(64);
     private static final Instant CREATED_AT = Instant.parse("2026-08-26T18:00:00Z");
     private static final Instant TESTED_AT = Instant.parse("2026-08-26T18:05:00Z");
     private static final TestOutputSanitizer DEFAULT_SANITIZER =
@@ -92,6 +95,42 @@ class SQLitePersistenceIntegrationTests {
     }
 
     @Test
+    void migratesVersionFourHistoryWithExplicitLegacyProvenance() {
+        Path dataDirectory = temporaryDirectory.resolve("version-four-upgrade");
+        try (LockedSQLiteDataSource dataSource = new SQLiteDataSourceFactory().create(dataDirectory)) {
+            Flyway versionFour = Flyway.configure()
+                    .dataSource(dataSource)
+                    .locations("classpath:db/migration")
+                    .target(MigrationVersion.fromVersion("4"))
+                    .cleanDisabled(true)
+                    .load();
+            versionFour.migrate();
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            labs.create(lab(temporaryDirectory.resolve("old-workspace"), "Old history"));
+            JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+            insertRawTestRun(jdbc, "old-run", "lab-1", "PASSED", 0, "old output", "");
+
+            Flyway current = Flyway.configure()
+                    .dataSource(dataSource)
+                    .locations("classpath:db/migration")
+                    .cleanDisabled(true)
+                    .validateOnMigrate(true)
+                    .load();
+            current.migrate();
+
+            TestRunRecord migrated = new SQLiteTestRunRepository(dataSource)
+                    .findById("old-run")
+                    .orElseThrow();
+            assertThat(migrated.labRevision()).isZero();
+            assertThat(migrated.service()).isEqualTo("legacy");
+            assertThat(migrated.testPlanSha256()).isEqualTo("sha256:" + "0".repeat(64));
+            assertThat(migrated.outcomeReason()).isEqualTo(TestOutcomeReason.LEGACY);
+            assertThat(jdbc.queryForObject("PRAGMA quick_check", String.class)).isEqualTo("ok");
+            assertThat(jdbc.queryForList("PRAGMA foreign_key_check")).isEmpty();
+        }
+    }
+
+    @Test
     void enforcesSchemaOutputAndReferenceConstraints() {
         Path dataDirectory = temporaryDirectory.resolve("constraints");
         Path workspace = temporaryDirectory.resolve("workspace");
@@ -123,8 +162,12 @@ class SQLitePersistenceIntegrationTests {
             TestRunRecord restoredOutput = new TestRunRecord(
                     "unsafe-restored",
                     "lab-1",
+                    2,
+                    "app",
+                    TEST_PLAN_SHA256,
                     TESTED_AT,
                     TestStatus.ERROR,
+                    TestOutcomeReason.DOCKER_ERROR,
                     Duration.ZERO,
                     OptionalInt.empty(),
                     StoredOutput.fromPersistence(credentialLikeText(), false),
@@ -135,6 +178,23 @@ class SQLitePersistenceIntegrationTests {
 
             new SQLiteTestRunRepository(dataSource).append(result(
                     "kept-history", TestStatus.PASSED, OptionalInt.of(0), "ok", ""));
+            assertThatThrownBy(() -> jdbc.update(
+                            "UPDATE test_run SET outcome_reason = 'DOCKER_ERROR' WHERE id = ?",
+                            "kept-history"))
+                    .isInstanceOf(DataAccessException.class);
+            assertThatThrownBy(() -> jdbc.update(
+                            "UPDATE test_run SET test_plan_sha256 = ? WHERE id = ?",
+                            "sha256:a" + "Z".repeat(63),
+                            "kept-history"))
+                    .isInstanceOf(DataAccessException.class);
+            assertThatThrownBy(() -> jdbc.update(
+                            "UPDATE test_run SET service_id = '!!!' WHERE id = ?",
+                            "kept-history"))
+                    .isInstanceOf(DataAccessException.class);
+            assertThatThrownBy(() -> jdbc.update(
+                            "UPDATE test_run SET outcome_reason = 'LEGACY' WHERE id = ?",
+                            "kept-history"))
+                    .isInstanceOf(DataAccessException.class);
             assertThatThrownBy(() -> jdbc.update("DELETE FROM lab WHERE id = ?", "lab-1"))
                     .isInstanceOf(DataAccessException.class);
             assertThat(jdbc.queryForObject("SELECT count(*) FROM test_run", Integer.class)).isEqualTo(1);
@@ -157,8 +217,12 @@ class SQLitePersistenceIntegrationTests {
             TestRunRecord scrubbed = TestRunRecord.bounded(
                     "privacy-run",
                     "lab-1",
+                    2,
+                    "app",
+                    TEST_PLAN_SHA256,
                     TESTED_AT,
                     TestStatus.ERROR,
+                    TestOutcomeReason.DOCKER_ERROR,
                     Duration.ZERO,
                     OptionalInt.empty(),
                     sanitizer,
@@ -194,7 +258,11 @@ class SQLitePersistenceIntegrationTests {
                     "stdout",
                     "stderr",
                     "stdout_truncated",
-                    "stderr_truncated");
+                    "stderr_truncated",
+                    "lab_revision",
+                    "service_id",
+                    "test_plan_sha256",
+                    "outcome_reason");
             assertThat(columnNames(jdbc, "lab_runtime_failure")).containsExactly(
                     "lab_id",
                     "lab_revision",
@@ -239,6 +307,78 @@ class SQLitePersistenceIntegrationTests {
         }
     }
 
+    @Test
+    void retainsAtMostOneHundredRunsPerLabAndOneThousandRunsTotal() throws Exception {
+        Path dataDirectory = temporaryDirectory.resolve("retention");
+        try (LockedSQLiteDataSource dataSource = openAndMigrate(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            SQLiteTestRunRepository tests = new SQLiteTestRunRepository(dataSource);
+            for (int labIndex = 0; labIndex < 11; labIndex++) {
+                String labId = "lab-" + labIndex;
+                Path workspace = temporaryDirectory.resolve("workspace-" + labIndex);
+                labs.create(new LabRecord(
+                        labId,
+                        "project-" + labIndex,
+                        "Retention lab " + labIndex,
+                        1,
+                        workspace,
+                        LabState.IMPORTED,
+                        0,
+                        CREATED_AT,
+                        CREATED_AT));
+                for (int runIndex = 0; runIndex < 101; runIndex++) {
+                    String runId = "run-%02d-%03d".formatted(labIndex, runIndex);
+                    tests.append(result(
+                            runId,
+                            labId,
+                            TESTED_AT.plusMillis((long) labIndex * 101 + runIndex)));
+                }
+                assertThat(tests.findRecentByLab(labId, 100)).hasSize(100);
+            }
+
+            JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM test_run", Integer.class))
+                    .isEqualTo(1_000);
+            assertThat(jdbc.queryForObject(
+                            "SELECT max(lab_count) FROM (SELECT count(*) AS lab_count FROM test_run GROUP BY lab_id)",
+                            Integer.class))
+                    .isEqualTo(100);
+        }
+    }
+
+    @Test
+    void rollsBackTheInsertWhenRetentionFails() {
+        Path dataDirectory = temporaryDirectory.resolve("retention-rollback");
+        try (LockedSQLiteDataSource dataSource = openAndMigrate(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            SQLiteTestRunRepository tests = new SQLiteTestRunRepository(dataSource);
+            labs.create(lab(temporaryDirectory.resolve("rollback-workspace"), "Rollback lab"));
+            for (int index = 0; index < 100; index++) {
+                tests.append(result(
+                        "old-%03d".formatted(index),
+                        "lab-1",
+                        TESTED_AT.plusMillis(index)));
+            }
+            JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+            jdbc.execute("""
+                    CREATE TRIGGER reject_test_run_retention
+                    BEFORE DELETE ON test_run
+                    BEGIN
+                        SELECT RAISE(ABORT, 'simulated retention failure');
+                    END
+                    """);
+
+            assertThatThrownBy(() -> tests.append(result(
+                            "new-run", "lab-1", TESTED_AT.plusSeconds(1))))
+                    .isInstanceOf(DataAccessException.class);
+
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM test_run", Integer.class))
+                    .isEqualTo(100);
+            assertThat(tests.findById("new-run")).isEmpty();
+            assertThat(jdbc.queryForObject("PRAGMA quick_check", String.class)).isEqualTo("ok");
+        }
+    }
+
     private LockedSQLiteDataSource openAndMigrate(Path dataDirectory) {
         LockedSQLiteDataSource dataSource = new SQLiteDataSourceFactory().create(dataDirectory);
         try {
@@ -250,7 +390,7 @@ class SQLitePersistenceIntegrationTests {
                     .validateOnMigrate(true)
                     .load();
             flyway.migrate();
-            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("5");
             return dataSource;
         } catch (RuntimeException | AssertionError exception) {
             dataSource.close();
@@ -280,13 +420,44 @@ class SQLitePersistenceIntegrationTests {
         return TestRunRecord.bounded(
                 id,
                 "lab-1",
+                2,
+                "app",
+                TEST_PLAN_SHA256,
                 TESTED_AT,
                 status,
+                reason(status),
                 Duration.ofSeconds(3),
                 exitCode,
                 DEFAULT_SANITIZER,
                 stdout,
                 stderr);
+    }
+
+    private static TestRunRecord result(String id, String labId, Instant recordedAt) {
+        return TestRunRecord.bounded(
+                id,
+                labId,
+                2,
+                "app",
+                TEST_PLAN_SHA256,
+                recordedAt,
+                TestStatus.PASSED,
+                TestOutcomeReason.EXIT_ZERO,
+                Duration.ofSeconds(1),
+                OptionalInt.of(0),
+                DEFAULT_SANITIZER,
+                "ok",
+                "");
+    }
+
+    private static TestOutcomeReason reason(TestStatus status) {
+        return switch (status) {
+            case PASSED -> TestOutcomeReason.EXIT_ZERO;
+            case FAILED -> TestOutcomeReason.NON_ZERO_EXIT;
+            case ERROR -> TestOutcomeReason.DOCKER_ERROR;
+            case CANCELLED -> TestOutcomeReason.USER_CANCELLED;
+            case TIMED_OUT -> TestOutcomeReason.TIMEOUT;
+        };
     }
 
     private static String credentialLikeText() {

@@ -223,6 +223,122 @@ class DockerLabLifecycleTests {
     }
 
     @Test
+    void runsTheManifestTestAgainstTheExactActiveServiceWithoutChangingTheLab() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("test-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerLabTestResult result = lifecycle.executeTest(started.lab(), plan());
+
+        assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.COMPLETED);
+        assertThat(result.execution().exitCode()).hasValue(0);
+        assertThat(result.cancelCause()).isEmpty();
+        assertThat(labs.findById(lab.id()).orElseThrow()).isEqualTo(started.lab());
+        assertThat(engine.testCommands).containsExactly(List.of("true"));
+        lifecycle.stop(lab.id());
+        lifecycle.close();
+    }
+
+    @Test
+    void cancellationStopsTheExactLabBeforeReturningTheTerminalResult() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("cancel-test-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.blockTest = true;
+        engine.resources.put("foreign-sentinel", null);
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        try (ExecutorService execution = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<DockerLabTestResult> running = execution.submit(
+                    () -> lifecycle.executeTest(started.lab(), plan()));
+            assertThat(engine.testEntered.await(1, TimeUnit.SECONDS)).isTrue();
+
+            assertThat(lifecycle.cancelTest(lab.id())).isTrue();
+            DockerLabTestResult result = running.get(3, TimeUnit.SECONDS);
+
+            assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.CANCELLED);
+            assertThat(result.cancelCause()).contains(DockerTestCancelCause.USER_CANCELLED);
+            assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+            assertThat(engine.resources).containsKey("foreign-sentinel");
+            assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
+        } finally {
+            lifecycle.close();
+        }
+    }
+
+    @Test
+    void anAmbiguousTestErrorStopsTheExactLabBeforeReturning() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("error-test-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.testState = DockerTestExecutionState.ERROR;
+        engine.resources.put("foreign-sentinel", null);
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerLabTestResult result = lifecycle.executeTest(started.lab(), plan());
+
+        assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.ERROR);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+        assertThat(engine.resources).containsKey("foreign-sentinel");
+        assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
+        lifecycle.close();
+    }
+
+    @Test
+    void aThrownTestOwnershipFailureStopsTheExactLabBeforeReturningAnError() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("ownership-error-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.testFailure = new DockerOwnershipException("simulated post-start inspection failure");
+        engine.resources.put("foreign-sentinel", null);
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerLabTestResult result = lifecycle.executeTest(started.lab(), plan());
+
+        assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.ERROR);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+        assertThat(engine.resources).containsKey("foreign-sentinel");
+        assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
+        lifecycle.close();
+    }
+
+    @Test
+    void cancellationBeforeDockerExecRegistrationStopsTheLabAndReturnsCancelled() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("early-cancel-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerLabTestResult result = lifecycle.executeTest(started.lab(), plan(), () -> true);
+
+        assertThat(result.execution().state()).isEqualTo(DockerTestExecutionState.CANCELLED);
+        assertThat(result.cancelCause()).contains(DockerTestCancelCause.USER_CANCELLED);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+        lifecycle.close();
+    }
+
+    @Test
     void observationHasAFiveSecondAggregateDeadline() throws Exception {
         Path workspace = Files.createDirectories(temporaryDirectory.resolve("observation-timeout-workspace"));
         LabRecord lab = lab(workspace);
@@ -273,6 +389,37 @@ class DockerLabLifecycleTests {
 
         LabRecord stopped = lifecycle.stop(lab.id(), started.lab().revision());
         assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+    }
+
+    @Test
+    void staleStopDoesNotCancelAnActiveAssignmentTest() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("stale-test-stop-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.blockTest = true;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        DockerStartResult started = lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        try (ExecutorService execution = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<DockerLabTestResult> running = execution.submit(
+                    () -> lifecycle.executeTest(started.lab(), plan()));
+            assertThat(engine.testEntered.await(1, TimeUnit.SECONDS)).isTrue();
+
+            assertThatThrownBy(() -> lifecycle.stop(lab.id(), 0))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("changed");
+
+            assertThat(running.get(3, TimeUnit.SECONDS).execution().state())
+                    .isEqualTo(DockerTestExecutionState.COMPLETED);
+            assertThat(labs.findById(lab.id()).orElseThrow().state())
+                    .isEqualTo(LabState.RUNNING);
+        } finally {
+            lifecycle.stop(lab.id());
+            lifecycle.close();
+        }
     }
 
     @Test
@@ -404,6 +551,68 @@ class DockerLabLifecycleTests {
                     .hasCauseInstanceOf(DockerOperationCancelledException.class);
             assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
             assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("network-"));
+        }
+    }
+
+    @Test
+    void versionedStopSignalsTheCurrentStartingRevision() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("versioned-stop-during-start"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.healthStatus = DockerHealthStatus.STARTING;
+        CountDownLatch startedContainer = new CountDownLatch(1);
+        engine.afterStart = startedContainer::countDown;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> start = executor.submit(() -> lifecycle.start(lab, plan(), CancellationToken.NONE));
+            assertThat(startedContainer.await(2, TimeUnit.SECONDS)).isTrue();
+            LabRecord starting = labs.findById(lab.id()).orElseThrow();
+            assertThat(starting.state()).isEqualTo(LabState.STARTING);
+
+            LabRecord stopped = lifecycle.stop(lab.id(), starting.revision());
+
+            assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+            assertThatThrownBy(() -> start.get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(DockerOperationCancelledException.class);
+        } finally {
+            lifecycle.close();
+        }
+    }
+
+    @Test
+    void staleStopDuringAStartDoesNotCancelTheNewerStart() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("stale-stop-during-start"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.healthStatus = DockerHealthStatus.STARTING;
+        CountDownLatch startedContainer = new CountDownLatch(1);
+        engine.afterStart = startedContainer::countDown;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<DockerStartResult> start = executor.submit(
+                    () -> lifecycle.start(lab, plan(), CancellationToken.NONE));
+            assertThat(startedContainer.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STARTING);
+
+            assertThatThrownBy(() -> lifecycle.stop(lab.id(), 0))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("changed");
+
+            engine.healthStatus = DockerHealthStatus.HEALTHY;
+            DockerStartResult started = start.get(3, TimeUnit.SECONDS);
+            assertThat(started.lab().state()).isEqualTo(LabState.RUNNING);
+            lifecycle.stop(lab.id(), started.lab().revision());
+        } finally {
+            lifecycle.close();
         }
     }
 
@@ -795,6 +1004,10 @@ class DockerLabLifecycleTests {
                     command: ["sleep", "30"]
                     healthcheck:
                       command: ["true"]
+                tests:
+                  service: app
+                  command: ["true"]
+                  timeout: 5s
                 """;
         return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
     }
@@ -964,6 +1177,11 @@ class DockerLabLifecycleTests {
         private final AtomicBoolean interruptOnlyObservation = new AtomicBoolean();
         private final CountDownLatch observationEntered = new CountDownLatch(1);
         private final CountDownLatch observationReleased = new CountDownLatch(1);
+        private final CountDownLatch testEntered = new CountDownLatch(1);
+        private final List<List<String>> testCommands = new ArrayList<>();
+        private boolean blockTest;
+        private DockerTestExecutionState testState = DockerTestExecutionState.COMPLETED;
+        private RuntimeException testFailure;
 
         void addImage(String reference, String id) {
             DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of(), false);
@@ -1151,6 +1369,46 @@ class DockerLabLifecycleTests {
                 DockerResourceRecord active, int tail, Consumer<DockerLogLine> consumer) {
             requireOwned(active.engineId().orElseThrow(), active);
             return new TestLogSubscription();
+        }
+
+        @Override
+        public DockerTestExecutionResult executeContainerTest(
+                DockerResourceRecord active,
+                List<String> command,
+                String workingDirectory,
+                Duration timeout,
+                CancellationToken cancellation) {
+            cancellation.throwIfCancellationRequested();
+            requireOwned(active.engineId().orElseThrow(), active);
+            testCommands.add(List.copyOf(command));
+            testEntered.countDown();
+            if (testFailure != null) {
+                throw testFailure;
+            }
+            if (blockTest) {
+                long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                while (!cancellation.isCancellationRequested() && System.nanoTime() < deadline) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(
+                            TimeUnit.MILLISECONDS.toNanos(5));
+                }
+                if (cancellation.isCancellationRequested()) {
+                    return new DockerTestExecutionResult(
+                            DockerTestExecutionState.CANCELLED,
+                            java.util.OptionalInt.empty(),
+                            "partial",
+                            "",
+                            false,
+                            false);
+                }
+            }
+            return new DockerTestExecutionResult(
+                    testState,
+                    testState == DockerTestExecutionState.COMPLETED
+                            ? java.util.OptionalInt.of(0) : java.util.OptionalInt.empty(),
+                    "passed",
+                    "",
+                    false,
+                    false);
         }
 
         @Override

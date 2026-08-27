@@ -50,6 +50,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class DockerJavaLabEngine implements DockerEnginePort {
 
+    private static final long CONTAINER_PID_LIMIT = 256L;
+
     private static final Pattern VOLUME_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]{0,254}");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final int MAX_LOG_TAIL = 500;
@@ -346,6 +348,8 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withMemory(specification.resourceLimits().memoryBytes())
                 .withMemorySwap(specification.resourceLimits().memoryBytes())
                 .withNanoCPUs(specification.resourceLimits().nanoCpus())
+                .withPidsLimit(CONTAINER_PID_LIMIT)
+                .withInit(true)
                 .withOomKillDisable(false)
                 .withAutoRemove(false)
                 .withPrivileged(false)
@@ -511,6 +515,107 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         Objects.requireNonNull(consumer, "consumer");
         return openLogCallback(
                 active, tail, true, LOG_STREAM_LINES, LOG_STREAM_BYTES, consumer);
+    }
+
+    @Override
+    public DockerTestExecutionResult executeContainerTest(
+            DockerResourceRecord active,
+            List<String> command,
+            String workingDirectory,
+            Duration timeout,
+            CancellationToken cancellation) {
+        requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        requireTestCommand(command, workingDirectory, timeout);
+        cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
+        InspectContainerResponse container = inspectOwnedContainer(active);
+        if (container.getState() == null || !Boolean.TRUE.equals(container.getState().getRunning())) {
+            throw new DockerActiveServiceNotFoundException();
+        }
+        cancellation.throwIfCancellationRequested();
+
+        String execId;
+        try {
+            execId = docker.execCreateCmd(active.engineId().orElseThrow())
+                    .withAttachStdin(false)
+                    .withAttachStdout(true)
+                    .withAttachStderr(true)
+                    .withTty(false)
+                    .withPrivileged(false)
+                    .withWorkingDir(workingDirectory)
+                    .withCmd(command.toArray(String[]::new))
+                    .exec()
+                    .getId();
+        } catch (RuntimeException failure) {
+            return failedTestResult("", "", false, false);
+        }
+        if (execId == null || execId.isBlank()) {
+            return failedTestResult("", "", false, false);
+        }
+        var created = inspectExecSafely(execId);
+        requireExecIdentity(created, active, command, true);
+        if (cancellation.isCancellationRequested()) {
+            return testResult(DockerTestExecutionState.CANCELLED, null);
+        }
+
+        long startedAt = System.nanoTime();
+        long deadline = startedAt + timeout.toNanos();
+        long startGraceDeadline = Math.min(
+                deadline, startedAt + Duration.ofMillis(250).toNanos());
+        BoundedDockerTestCallback callback = new BoundedDockerTestCallback();
+        try {
+            docker.execStartCmd(execId)
+                    .withDetach(false)
+                    .withTty(false)
+                    .exec(callback);
+            boolean observedRunning = false;
+            while (true) {
+                if (cancellation.isCancellationRequested()) {
+                    callback.close();
+                    return testResult(DockerTestExecutionState.CANCELLED, callback);
+                }
+                var observed = inspectExecSafely(execId);
+                requireExecIdentity(observed, active, command, false);
+                if (Boolean.TRUE.equals(observed.isRunning())) {
+                    observedRunning = true;
+                } else if (observedRunning) {
+                    return completedTestResult(execId, active, command, callback);
+                } else if (System.nanoTime() >= startGraceDeadline
+                        && callback.await(Duration.ofMillis(50))) {
+                    var confirmed = inspectExecSafely(execId);
+                    requireExecIdentity(confirmed, active, command, false);
+                    if (Boolean.TRUE.equals(confirmed.isRunning())) {
+                        observedRunning = true;
+                    } else if (confirmed.getExitCodeLong() != null) {
+                        return completedTestResult(execId, active, command, callback);
+                    }
+                }
+                long remainingNanos = deadline - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    callback.close();
+                    return testResult(DockerTestExecutionState.TIMED_OUT, callback);
+                }
+                long waitMillis = Math.max(
+                        1L,
+                        Math.min(100L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+                if (callback.await(Duration.ofMillis(waitMillis))) {
+                    Thread.sleep(waitMillis);
+                }
+                if (callback.failed()) {
+                    return testResult(DockerTestExecutionState.ERROR, callback);
+                }
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            callback.close();
+            return testResult(DockerTestExecutionState.CANCELLED, callback);
+        } catch (DockerOwnershipException failure) {
+            throw failure;
+        } catch (RuntimeException failure) {
+            callback.close();
+            return testResult(DockerTestExecutionState.ERROR, callback);
+        } finally {
+            callback.close();
+        }
     }
 
     @Override
@@ -697,13 +802,15 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                         .equals(actual.getHostConfig().getMemorySwap())
                 || !Long.valueOf(expected.resourceLimits().nanoCpus())
                         .equals(actual.getHostConfig().getNanoCPUs())
+                || !Long.valueOf(CONTAINER_PID_LIMIT).equals(actual.getHostConfig().getPidsLimit())
+                || !Boolean.TRUE.equals(actual.getHostConfig().getInit())
                 || Boolean.TRUE.equals(actual.getHostConfig().getPublishAllPorts())
                 || Boolean.TRUE.equals(actual.getHostConfig().getOomKillDisable())
                 || actual.getHostConfig().getLogConfig() == null
                 || actual.getHostConfig().getLogConfig().getType() != LogConfig.LoggingType.LOCAL
                 || !LOG_OPTIONS.equals(actual.getHostConfig().getLogConfig().getConfig())) {
             throw new DockerOwnershipException(
-                    "Docker created a container with different image, network, logging, or resource limits than planned.");
+                    "Docker created a container with different image, network, process, logging, or resource limits than planned.");
         }
         requirePortBindingShape(actual, expected);
         requireHealthCheckShape(actual, expected);
@@ -1032,6 +1139,111 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             callback.close();
             throw new DockerLogAccessException();
         }
+    }
+
+    private com.github.dockerjava.api.command.InspectExecResponse inspectExecSafely(String execId) {
+        try {
+            return docker.inspectExecCmd(execId).exec();
+        } catch (RuntimeException failure) {
+            throw new DockerOwnershipException("Docker could not verify the constrained test process.");
+        }
+    }
+
+    private DockerTestExecutionResult completedTestResult(
+            String execId,
+            DockerResourceRecord active,
+            List<String> command,
+            BoundedDockerTestCallback callback) throws InterruptedException {
+        if (!callback.await(Duration.ofSeconds(1)) || callback.failed()) {
+            return testResult(DockerTestExecutionState.ERROR, callback);
+        }
+        var completed = inspectExecSafely(execId);
+        requireExecIdentity(completed, active, command, true);
+        Long exitCode = completed.getExitCodeLong();
+        if (exitCode == null || exitCode < Integer.MIN_VALUE || exitCode > Integer.MAX_VALUE) {
+            return testResult(DockerTestExecutionState.ERROR, callback);
+        }
+        return new DockerTestExecutionResult(
+                DockerTestExecutionState.COMPLETED,
+                OptionalInt.of(exitCode.intValue()),
+                callback.stdout(),
+                callback.stderr(),
+                callback.stdoutTruncated(),
+                callback.stderrTruncated());
+    }
+
+    private static void requireExecIdentity(
+            com.github.dockerjava.api.command.InspectExecResponse inspection,
+            DockerResourceRecord active,
+            List<String> command,
+            boolean requireStopped) {
+        if (inspection == null
+                || !active.engineId().orElseThrow().equals(inspection.getContainerID())
+                || (requireStopped && Boolean.TRUE.equals(inspection.isRunning()))
+                || inspection.getProcessConfig() == null
+                || Boolean.TRUE.equals(inspection.getProcessConfig().isPrivileged())
+                || Boolean.TRUE.equals(inspection.getProcessConfig().isTty())
+                || !command.getFirst().equals(inspection.getProcessConfig().getEntryPoint())
+                || !command.subList(1, command.size()).equals(inspection.getProcessConfig().getArguments())) {
+            throw new DockerOwnershipException(
+                    "Docker reported a different constrained test process than LabDeck created.");
+        }
+    }
+
+    private static void requireTestCommand(
+            List<String> command, String workingDirectory, Duration timeout) {
+        Objects.requireNonNull(command, "command");
+        if (command.isEmpty()
+                || command.size() > 64
+                || command.stream().anyMatch(argument -> argument == null
+                        || argument.isEmpty()
+                        || argument.length() > 4_096
+                        || argument.codePoints().anyMatch(Character::isISOControl))) {
+            throw new IllegalArgumentException("The Docker test argv is not valid.");
+        }
+        if (workingDirectory == null
+                || !workingDirectory.startsWith("/workspace")
+                || workingDirectory.contains("..")
+                || workingDirectory.codePoints().anyMatch(Character::isISOControl)) {
+            throw new IllegalArgumentException("The Docker test working directory is not valid.");
+        }
+        requireTimeout(timeout, Duration.ofSeconds(1), Duration.ofMinutes(30));
+    }
+
+    private static DockerTestExecutionResult failedTestResult(
+            String stdout, String stderr, boolean stdoutTruncated, boolean stderrTruncated) {
+        return new DockerTestExecutionResult(
+                DockerTestExecutionState.ERROR,
+                OptionalInt.empty(),
+                stdout,
+                stderr,
+                stdoutTruncated,
+                stderrTruncated);
+    }
+
+    private static DockerTestExecutionResult testResult(
+            DockerTestExecutionState state, BoundedDockerTestCallback callback) {
+        return failedTestResultForState(
+                state,
+                callback == null ? "" : callback.stdout(),
+                callback == null ? "" : callback.stderr(),
+                callback != null && callback.stdoutTruncated(),
+                callback != null && callback.stderrTruncated());
+    }
+
+    private static DockerTestExecutionResult failedTestResultForState(
+            DockerTestExecutionState state,
+            String stdout,
+            String stderr,
+            boolean stdoutTruncated,
+            boolean stderrTruncated) {
+        return new DockerTestExecutionResult(
+                state,
+                OptionalInt.empty(),
+                stdout,
+                stderr,
+                stdoutTruncated,
+                stderrTruncated);
     }
 
     private static List<DockerPortMapping> inspectPublishedPorts(

@@ -11,9 +11,11 @@ import io.labdeck.docker.DockerOwnershipException;
 import io.labdeck.docker.DockerPortCollisionException;
 import io.labdeck.docker.DockerServiceReadinessException;
 import io.labdeck.docker.DockerStorageFullException;
+import io.labdeck.docker.DockerTestStartException;
 import io.labdeck.manifest.ManifestProblem;
 import io.labdeck.manifest.ManifestValidationException;
 import io.labdeck.manifest.WorkspaceManifestException;
+import io.labdeck.lab.TestRunCoordinatorException;
 import jakarta.validation.ConstraintViolationException;
 import java.net.URI;
 import java.util.LinkedHashMap;
@@ -47,6 +49,39 @@ public class ApiExceptionHandler {
                 exception.title(),
                 exception.getMessage(),
                 exception.properties());
+    }
+
+    @ExceptionHandler(TestRunCoordinatorException.class)
+    ResponseEntity<ProblemDetail> testRun(TestRunCoordinatorException exception) {
+        HttpStatus status = switch (exception.reason()) {
+            case TEST_NOT_CONFIGURED, TEST_ALREADY_RUNNING -> HttpStatus.CONFLICT;
+            case PROCESS_LIMIT_REACHED -> HttpStatus.TOO_MANY_REQUESTS;
+            case RUNNER_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
+            case TEST_RUN_NOT_FOUND -> HttpStatus.NOT_FOUND;
+        };
+        String code = switch (exception.reason()) {
+            case TEST_NOT_CONFIGURED -> "TEST_NOT_CONFIGURED";
+            case TEST_ALREADY_RUNNING -> "TEST_ALREADY_RUNNING";
+            case PROCESS_LIMIT_REACHED -> "TEST_PROCESS_LIMIT_REACHED";
+            case RUNNER_UNAVAILABLE -> "TEST_RUNNER_UNAVAILABLE";
+            case TEST_RUN_NOT_FOUND -> "TEST_RUN_NOT_FOUND";
+        };
+        return problem(
+                status,
+                code,
+                "Assignment test unavailable",
+                exception.getMessage(),
+                Map.of());
+    }
+
+    @ExceptionHandler(DockerTestStartException.class)
+    ResponseEntity<ProblemDetail> testStart(DockerTestStartException exception) {
+        return problem(
+                HttpStatus.CONFLICT,
+                "TEST_" + exception.reason().name(),
+                "Assignment test cannot start",
+                exception.getMessage(),
+                Map.of());
     }
 
     @ExceptionHandler(ManifestValidationException.class)

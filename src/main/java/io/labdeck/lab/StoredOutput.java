@@ -21,6 +21,14 @@ public final class StoredOutput {
     }
 
     static StoredOutput bounded(String input, int maxUtf8Bytes, TestOutputSanitizer sanitizer) {
+        return bounded(input, maxUtf8Bytes, sanitizer, false);
+    }
+
+    static StoredOutput bounded(
+            String input,
+            int maxUtf8Bytes,
+            TestOutputSanitizer sanitizer,
+            boolean sourceTruncated) {
         Objects.requireNonNull(sanitizer, "sanitizer");
         if (maxUtf8Bytes < 0 || maxUtf8Bytes > MAX_UTF8_BYTES) {
             throw new IllegalArgumentException("The output byte limit is not valid.");
@@ -28,7 +36,7 @@ public final class StoredOutput {
 
         String sanitized = sanitizer.sanitize(input);
         if (sanitized.isEmpty()) {
-            return new StoredOutput("", false, true);
+            return new StoredOutput("", sourceTruncated, true);
         }
 
         StringBuilder result = new StringBuilder(Math.min(sanitized.length(), maxUtf8Bytes));
@@ -49,7 +57,7 @@ public final class StoredOutput {
             bytes += codePointBytes;
         }
         return new StoredOutput(
-                result.toString(), truncated || result.length() < sanitized.length(), true);
+                result.toString(), sourceTruncated || truncated || result.length() < sanitized.length(), true);
     }
 
     public static StoredOutput fromPersistence(String text, boolean truncated) {

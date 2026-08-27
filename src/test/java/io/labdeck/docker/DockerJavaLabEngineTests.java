@@ -8,13 +8,20 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecCmd;
+import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.command.PullImageCmd;
 import com.github.dockerjava.api.command.PullImageResultCallback;
@@ -25,6 +32,7 @@ import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.transport.DockerHttpClient;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
@@ -262,6 +270,135 @@ class DockerJavaLabEngineTests {
         assertThat(json.get("Propagation").textValue()).isEqualTo("rprivate");
     }
 
+    @Test
+    void executesOnlyTheExactArgvWithoutStdinTtyPrivilegeOrEnvironmentOverrides() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        DockerResourceRecord container = activeContainer();
+        InspectContainerResponse containerInspection = mockOwnedInspection(docker, container);
+        var containerState = mock(InspectContainerResponse.ContainerState.class);
+        when(containerInspection.getState()).thenReturn(containerState);
+        when(containerState.getRunning()).thenReturn(true);
+
+        ExecCreateCmd create = mock(ExecCreateCmd.class);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(docker.execCreateCmd("container-id")).thenReturn(create);
+        when(create.withAttachStdin(anyBoolean())).thenReturn(create);
+        when(create.withAttachStdout(anyBoolean())).thenReturn(create);
+        when(create.withAttachStderr(anyBoolean())).thenReturn(create);
+        when(create.withTty(anyBoolean())).thenReturn(create);
+        when(create.withPrivileged(anyBoolean())).thenReturn(create);
+        when(create.withWorkingDir(any())).thenReturn(create);
+        when(create.withCmd(any(String[].class))).thenReturn(create);
+        when(create.exec()).thenReturn(created);
+        when(created.getId()).thenReturn("private-exec-id");
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse execInspection = mock(InspectExecResponse.class);
+        InspectExecResponse.ProcessConfig process = mock(InspectExecResponse.ProcessConfig.class);
+        when(docker.inspectExecCmd("private-exec-id")).thenReturn(inspectExec);
+        when(inspectExec.exec()).thenReturn(execInspection);
+        when(execInspection.getContainerID()).thenReturn("container-id");
+        when(execInspection.isRunning()).thenReturn(false);
+        when(execInspection.getProcessConfig()).thenReturn(process);
+        when(process.isPrivileged()).thenReturn(false);
+        when(process.isTty()).thenReturn(false);
+        when(process.getEntryPoint()).thenReturn("printf");
+        when(process.getArguments()).thenReturn(List.of("literal;$HOME"));
+        when(execInspection.getExitCodeLong()).thenReturn(0L);
+
+        ExecStartCmd start = mock(ExecStartCmd.class);
+        when(docker.execStartCmd("private-exec-id")).thenReturn(start);
+        when(start.withDetach(anyBoolean())).thenReturn(start);
+        when(start.withTty(anyBoolean())).thenReturn(start);
+        doAnswer(invocation -> {
+                    @SuppressWarnings("unchecked")
+                    ResultCallback<Frame> callback = invocation.getArgument(0);
+                    callback.onNext(new Frame(StreamType.STDOUT, "ok".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                    callback.onComplete();
+                    return callback;
+                })
+                .when(start).exec(any());
+
+        DockerTestExecutionResult result = new DockerJavaLabEngine(docker, http)
+                .executeContainerTest(
+                        container,
+                        List.of("printf", "literal;$HOME"),
+                        "/workspace",
+                        Duration.ofSeconds(2),
+                        CancellationToken.NONE);
+
+        assertThat(result.state()).isEqualTo(DockerTestExecutionState.COMPLETED);
+        assertThat(result.exitCode()).hasValue(0);
+        assertThat(result.stdout()).isEqualTo("ok");
+        verify(create).withAttachStdin(false);
+        verify(create).withAttachStdout(true);
+        verify(create).withAttachStderr(true);
+        verify(create).withTty(false);
+        verify(create).withPrivileged(false);
+        verify(create).withWorkingDir("/workspace");
+        verify(create).withCmd("printf", "literal;$HOME");
+        verify(create, never()).withEnv(any());
+        verify(start).withDetach(false);
+        verify(start).withTty(false);
+    }
+
+    @Test
+    void reportsAPostStartInspectionFailureAsAnAmbiguousOwnershipFailure() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        DockerResourceRecord container = activeContainer();
+        InspectContainerResponse containerInspection = mockOwnedInspection(docker, container);
+        var containerState = mock(InspectContainerResponse.ContainerState.class);
+        when(containerInspection.getState()).thenReturn(containerState);
+        when(containerState.getRunning()).thenReturn(true);
+
+        ExecCreateCmd create = mock(ExecCreateCmd.class);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(docker.execCreateCmd("container-id")).thenReturn(create);
+        when(create.withAttachStdin(anyBoolean())).thenReturn(create);
+        when(create.withAttachStdout(anyBoolean())).thenReturn(create);
+        when(create.withAttachStderr(anyBoolean())).thenReturn(create);
+        when(create.withTty(anyBoolean())).thenReturn(create);
+        when(create.withPrivileged(anyBoolean())).thenReturn(create);
+        when(create.withWorkingDir(any())).thenReturn(create);
+        when(create.withCmd(any(String[].class))).thenReturn(create);
+        when(create.exec()).thenReturn(created);
+        when(created.getId()).thenReturn("private-exec-id");
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse createdInspection = mock(InspectExecResponse.class);
+        InspectExecResponse.ProcessConfig process = mock(InspectExecResponse.ProcessConfig.class);
+        when(docker.inspectExecCmd("private-exec-id")).thenReturn(inspectExec);
+        when(inspectExec.exec())
+                .thenReturn(createdInspection)
+                .thenThrow(new IllegalStateException("simulated transport failure"));
+        when(createdInspection.getContainerID()).thenReturn("container-id");
+        when(createdInspection.isRunning()).thenReturn(false);
+        when(createdInspection.getProcessConfig()).thenReturn(process);
+        when(process.isPrivileged()).thenReturn(false);
+        when(process.isTty()).thenReturn(false);
+        when(process.getEntryPoint()).thenReturn("true");
+        when(process.getArguments()).thenReturn(List.of());
+
+        ExecStartCmd start = mock(ExecStartCmd.class);
+        when(docker.execStartCmd("private-exec-id")).thenReturn(start);
+        when(start.withDetach(anyBoolean())).thenReturn(start);
+        when(start.withTty(anyBoolean())).thenReturn(start);
+        doAnswer(invocation -> invocation.getArgument(0)).when(start).exec(any());
+
+        assertThatThrownBy(() -> new DockerJavaLabEngine(docker, http)
+                        .executeContainerTest(
+                                container,
+                                List.of("true"),
+                                "/workspace",
+                                Duration.ofSeconds(2),
+                                CancellationToken.NONE))
+                .isInstanceOf(DockerOwnershipException.class)
+                .hasMessage("Docker could not verify the constrained test process.")
+                .hasNoCause();
+    }
+
     private static DockerResourceRecord activeContainer() {
         Instant now = Instant.parse("2026-08-27T12:00:00Z");
         return new DockerResourceRecord(
@@ -276,7 +413,7 @@ class DockerJavaLabEngineTests {
                 now);
     }
 
-    private static void mockOwnedInspection(
+    private static InspectContainerResponse mockOwnedInspection(
             DockerClient docker, DockerResourceRecord container) {
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse response = mock(InspectContainerResponse.class);
@@ -285,5 +422,6 @@ class DockerJavaLabEngineTests {
         when(inspect.exec()).thenReturn(response);
         when(response.getConfig()).thenReturn(config);
         when(config.getLabels()).thenReturn(Map.copyOf(container.labels()));
+        return response;
     }
 }
