@@ -7,9 +7,9 @@ less time fighting dependencies and more time working on the assignment.
 
 > [!NOTE]
 > LabDeck is under active v1 development. The current bootstrap serves a tested Vue application
-> from one local Spring Boot process. The guarded Docker lifecycle is implemented behind the domain
-> port. The user-facing start flow, ports, health readiness, and resource limits are still tracked
-> in the v1 milestone and are not claimed as complete yet.
+> from one local Spring Boot process. The guarded Docker lifecycle, port policy, hard resource
+> limits, and health readiness are implemented behind the domain port. The user-facing start flow
+> is still tracked in the v1 milestone and is not claimed as complete yet.
 
 ## What works now
 
@@ -20,6 +20,10 @@ less time fighting dependencies and more time working on the assignment.
 - Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
 - Public-image inspection and confirmed pulls without Docker registry credentials.
 - Journaled Docker containers, private networks, persistent-volume identity, and exact cleanup.
+- Dynamic or fixed TCP ports bound only to `127.0.0.1`, with clear fixed-port conflicts.
+- Lab-wide memory and CPU ceilings divided across services, with Docker swap disabled.
+- Docker health readiness, bounded cancellation, unexpected-exit monitoring, and safe failure records.
+- Typed image-download and Docker-storage-full guidance without automatic pruning.
 - Workspace identity checks before structured bind mounts; no general Docker prune operations.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.
@@ -30,7 +34,7 @@ less time fighting dependencies and more time working on the assignment.
 Requirements:
 
 - Java 25 LTS
-- A Docker-compatible engine for lab features as they land
+- Docker Engine 28 or newer for labs that publish local ports
 
 ```bash
 ./mvnw clean package
@@ -94,7 +98,8 @@ Architecture decisions are recorded in
 [ADR-0001](docs/decisions/0001-local-modular-monolith.md) and
 [ADR-0002](docs/decisions/0002-restricted-manifest.md), and
 [ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md), and
-[ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md).
+[ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md), and
+[ADR-0005](docs/decisions/0005-local-ports-resource-budgets-and-readiness.md).
 
 ## Safety and privacy
 
@@ -126,3 +131,5 @@ SQLite persistence is tracked in
 [issue #4](https://github.com/mateoosoriodelhonte/labdeck/issues/4).
 Docker lifecycle and ownership are tracked in
 [issue #5](https://github.com/mateoosoriodelhonte/labdeck/issues/5).
+Ports, resource limits, and health readiness are tracked in
+[issue #6](https://github.com/mateoosoriodelhonte/labdeck/issues/6).

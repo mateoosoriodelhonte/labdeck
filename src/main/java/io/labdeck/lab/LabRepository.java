@@ -14,4 +14,13 @@ public interface LabRepository {
 
     boolean compareAndSetState(
             String id, long expectedRevision, LabState expected, LabState next, Instant updatedAt);
+
+    boolean compareAndSetStateWithFailure(
+            String id,
+            long expectedRevision,
+            LabState expected,
+            Instant updatedAt,
+            LabRuntimeFailure failure);
+
+    Optional<LabRuntimeFailure> findRuntimeFailure(String labId);
 }

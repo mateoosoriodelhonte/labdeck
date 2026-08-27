@@ -7,6 +7,10 @@ public interface DockerEnginePort {
 
     void verifyAvailable();
 
+    void verifyLocalPortPublishingSupported();
+
+    void verifyResourceLimitsSupported();
+
     Optional<DockerImageMetadata> inspectImage(String reference);
 
     void pullPublicImageAfterConfirmation(
@@ -21,9 +25,10 @@ public interface DockerEnginePort {
     DockerCreatedResource createContainer(
             DockerResourceRecord dispatched, DockerContainerSpec specification);
 
-    DockerContainerView inspectContainer(DockerResourceRecord active);
+    DockerContainerView inspectContainer(
+            DockerResourceRecord active, DockerContainerSpec specification);
 
-    void startContainer(DockerResourceRecord active);
+    void startContainer(DockerResourceRecord active, DockerContainerSpec specification);
 
     void stopContainer(DockerResourceRecord active, Duration timeout);
 

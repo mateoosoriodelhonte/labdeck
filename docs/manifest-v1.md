@@ -52,11 +52,17 @@ ports:
     protocol: tcp
 ```
 
-Omit `host` to request a free local port. LabDeck always binds published ports to `127.0.0.1`. V1 accepts TCP only. An explicit host port must be from 1024 through 65535.
+Omit `host` to request a Docker-selected free local port. LabDeck always binds published ports to `127.0.0.1` and reports the actual mapping after startup. V1 accepts TCP only. An explicit host port must be from 1024 through 65535. If another process owns a fixed port, startup fails with the service and port named. Published ports require Docker Engine 28 or newer because older releases did not fully isolate loopback-published ports from the local network.
+
+Each running lab uses its own non-attachable bridge network. Services in that lab can reach each other by service name. They cannot join another lab network through the manifest. The bridge uses Docker's normal outbound network behavior. LabDeck does not claim that a lab is an offline or hostile-code sandbox.
 
 Volumes are LabDeck-managed named volumes. V1 does not accept bind mounts. A volume cannot target `/`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/run`, `/sys`, or `/var/run`. A named volume also cannot equal, contain, or sit inside the approved workspace mount. This prevents a volume from hiding student files.
 
-Resource limits apply to every service. If `resources` is absent, LabDeck uses 1 GB of memory and 2 CPUs. Memory must be from 64 MiB through 8 GiB. CPU must be from 0.25 through 8.
+`resources` is the total lab budget. LabDeck divides it across services in stable service-name order. The service limits add up to no more than the lab budget. If `resources` is absent, LabDeck uses 1 GB of memory and 2 CPUs. Memory must be from 64 MiB through 8 GiB. CPU must be from 0.25 through 8. A multi-service lab must also leave at least 6 MiB and 0.01 CPU for each service.
+
+A manifest health check replaces an image health check and is sent as exact Docker `CMD` argv. If the manifest has no health check, LabDeck preserves the image health check. A service with either health policy must report Docker `healthy` before the lab becomes Running. A service with no health policy must remain running for two seconds; LabDeck does not label that service healthy. Readiness has a 30-second minimum window and a 15-minute hard ceiling, including every final Docker inspection. A two-second monitor checks a Running lab for later exits or unhealthy states.
+
+Confirmed image-download failures use fixed, safe messages. A narrow Docker `ENOSPC` or `no space left on device` result is reported as full Docker storage. LabDeck tells the student to free Docker storage and never prunes data automatically.
 
 ## Fields that always fail
 

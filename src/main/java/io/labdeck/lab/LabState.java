@@ -25,7 +25,7 @@ public enum LabState {
             case RUNNING -> EnumSet.of(STOPPING, FAILED);
             case STOPPING -> EnumSet.of(STOPPED, FAILED);
             case STOPPED -> EnumSet.of(STARTING);
-            case FAILED -> EnumSet.of(STARTING, STOPPED);
+            case FAILED -> EnumSet.of(STARTING, STOPPING);
         };
     }
 }

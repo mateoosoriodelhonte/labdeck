@@ -1,7 +1,9 @@
 package io.labdeck.docker;
 
+import io.labdeck.lab.LabFailureCode;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
+import io.labdeck.lab.LabRuntimeFailure;
 import io.labdeck.lab.LabState;
 import io.labdeck.manifest.ApprovedWorkspacePath;
 import io.labdeck.manifest.LabManifest.BuildSource;
@@ -25,14 +27,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 @Service
-public class DockerLabLifecycle {
+public class DockerLabLifecycle implements AutoCloseable {
 
     private static final Duration STOP_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration PULL_TIMEOUT = Duration.ofMinutes(15);
@@ -43,12 +47,24 @@ public class DockerLabLifecycle {
     private final ProjectPathPolicy paths;
     private final Clock clock;
     private final Supplier<String> tokenSupplier;
+    private final DockerReadinessWaiter readiness;
+    private final DockerRuntimeMonitorPort runtimeMonitor;
     private final ConcurrentHashMap<String, ReentrantLock> labLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ActiveStart> activeStarts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> stopRequests = new ConcurrentHashMap<>();
 
     @Autowired
     public DockerLabLifecycle(
             DockerEnginePort engine, DockerResourceJournal journal, LabRepository labs) {
-        this(engine, journal, labs, new ProjectPathPolicy(), Clock.systemUTC(), secureTokenSupplier());
+        this(
+                engine,
+                journal,
+                labs,
+                new ProjectPathPolicy(),
+                Clock.systemUTC(),
+                secureTokenSupplier(),
+                new DockerReadinessWaiter(),
+                new DockerRuntimeMonitor());
     }
 
     DockerLabLifecycle(
@@ -58,12 +74,53 @@ public class DockerLabLifecycle {
             ProjectPathPolicy paths,
             Clock clock,
             Supplier<String> tokenSupplier) {
+        this(
+                engine,
+                journal,
+                labs,
+                paths,
+                clock,
+                tokenSupplier,
+                new DockerReadinessWaiter(),
+                new DockerRuntimeMonitor());
+    }
+
+    DockerLabLifecycle(
+            DockerEnginePort engine,
+            DockerResourceJournal journal,
+            LabRepository labs,
+            ProjectPathPolicy paths,
+            Clock clock,
+            Supplier<String> tokenSupplier,
+            DockerReadinessWaiter readiness) {
+        this(
+                engine,
+                journal,
+                labs,
+                paths,
+                clock,
+                tokenSupplier,
+                readiness,
+                new DockerRuntimeMonitor());
+    }
+
+    DockerLabLifecycle(
+            DockerEnginePort engine,
+            DockerResourceJournal journal,
+            LabRepository labs,
+            ProjectPathPolicy paths,
+            Clock clock,
+            Supplier<String> tokenSupplier,
+            DockerReadinessWaiter readiness,
+            DockerRuntimeMonitorPort runtimeMonitor) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.journal = Objects.requireNonNull(journal, "journal");
         this.labs = Objects.requireNonNull(labs, "labs");
         this.paths = Objects.requireNonNull(paths, "paths");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.tokenSupplier = Objects.requireNonNull(tokenSupplier, "tokenSupplier");
+        this.readiness = Objects.requireNonNull(readiness, "readiness");
+        this.runtimeMonitor = Objects.requireNonNull(runtimeMonitor, "runtimeMonitor");
     }
 
     public List<DockerImagePlan> inspectRequiredImages(ManifestPlan plan) {
@@ -109,9 +166,18 @@ public class DockerLabLifecycle {
             throw new IllegalArgumentException("The lab record and manifest plan do not match.");
         }
         cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
+        Map<String, ServiceDockerPolicy> policies = compileDockerPolicies(plan);
+        ActiveStart operation = new ActiveStart(cancellation);
+        if (activeStarts.putIfAbsent(requestedLab.id(), operation) != null) {
+            throw new IllegalStateException("Another start operation is already active for this lab.");
+        }
+        if (stopRequests.containsKey(requestedLab.id())) {
+            operation.cancel();
+        }
         ReentrantLock lock = lockFor(requestedLab.id());
         lock.lock();
         try {
+            operation.throwIfCancellationRequested();
             LabRecord current = labs.findById(requestedLab.id())
                     .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
             if (current.revision() != requestedLab.revision()
@@ -125,8 +191,12 @@ public class DockerLabLifecycle {
             ApprovedWorkspacePath workspace = paths.resolveWorkspace(current.workspace());
             preflightWorkspaceTargets(plan);
             engine.verifyAvailable();
+            engine.verifyResourceLimitsSupported();
+            if (policies.values().stream().anyMatch(policy -> !policy.ports().isEmpty())) {
+                engine.verifyLocalPortPublishingSupported();
+            }
             Map<String, DockerImageMetadata> images = resolveImages(plan);
-            cancellation.throwIfCancellationRequested();
+            operation.throwIfCancellationRequested();
 
             Instant transitionTime = now();
             LabRecord starting = current.transitionTo(LabState.STARTING, transitionTime);
@@ -136,22 +206,24 @@ public class DockerLabLifecycle {
             }
 
             LabOwnership ownership = new LabOwnership(starting.id(), starting.projectId());
+            LabRecord committedRun = null;
             try {
-                cleanupEphemeralResources(ownership, cancellation);
-                cancellation.throwIfCancellationRequested();
+                cleanupEphemeralResources(ownership, operation);
+                operation.throwIfCancellationRequested();
                 DockerResourceRecord network = createTracked(
                         ownership, DockerResourceType.NETWORK, "lab-network", engine::createNetwork);
 
                 Map<String, DockerResourceRecord> volumes = new TreeMap<>();
                 for (String logicalName : plan.volumes()) {
-                    cancellation.throwIfCancellationRequested();
+                    operation.throwIfCancellationRequested();
                     volumes.put(logicalName, ensurePersistentVolume(ownership, logicalName));
                 }
 
-                List<DockerResourceRecord> containers = new ArrayList<>();
+                List<PlannedContainer> containers = new ArrayList<>();
                 for (ServicePlan service : plan.services()) {
-                    cancellation.throwIfCancellationRequested();
+                    operation.throwIfCancellationRequested();
                     DockerImageMetadata image = images.get(service.id());
+                    ServiceDockerPolicy policy = policies.get(service.id());
                     List<DockerContainerSpec.NamedMount> mounts = service.definition().volumes().stream()
                             .map(volume -> {
                                 DockerResourceRecord resource = volumes.get(volume.name());
@@ -167,40 +239,68 @@ public class DockerLabLifecycle {
                             workspace,
                             plan.workspaceMount(),
                             network.engineId().orElseThrow(),
-                            mounts);
-                    containers.add(createTracked(
+                            mounts,
+                            policy.ports(),
+                            policy.resources(),
+                            policy.healthProbe(),
+                            image.healthCheckConfigured());
+                    DockerResourceRecord container = createTracked(
                             ownership,
                             DockerResourceType.CONTAINER,
                             service.id(),
-                            dispatched -> engine.createContainer(dispatched, specification)));
+                            dispatched -> engine.createContainer(dispatched, specification));
+                    containers.add(new PlannedContainer(container, specification));
                 }
 
-                List<DockerContainerView> views = new ArrayList<>();
-                for (DockerResourceRecord container : containers) {
-                    cancellation.throwIfCancellationRequested();
-                    engine.startContainer(container);
-                    views.add(engine.inspectContainer(container));
+                for (PlannedContainer container : containers) {
+                    operation.throwIfCancellationRequested();
+                    engine.startContainer(container.resource(), container.specification());
                 }
-                cancellation.throwIfCancellationRequested();
+                List<DockerReadinessWaiter.ServiceProbe> probes = containers.stream()
+                        .map(container -> new DockerReadinessWaiter.ServiceProbe(
+                                container.resource().logicalName(),
+                                container.specification().healthCheckRequired(),
+                                () -> engine.inspectContainer(
+                                        container.resource(), container.specification())))
+                        .toList();
+                List<DockerContainerView> views = readiness.await(
+                        probes, readinessTimeout(containers), operation);
+                operation.throwIfCancellationRequested();
+
+                Instant runningAt = now();
+                LabRecord running = starting.transitionTo(LabState.RUNNING, runningAt);
+                if (!operation.commitRunning(() -> labs.compareAndSetState(
+                        starting.id(), starting.revision(), LabState.STARTING, LabState.RUNNING, runningAt))) {
+                    throw new IllegalStateException("The ready lab state could not be stored.");
+                }
+                committedRun = running;
+                runtimeMonitor.watch(
+                        running.id(),
+                        running.revision(),
+                        probes,
+                        failure -> handleRuntimeFailure(running, ownership, failure));
                 return new DockerStartResult(
-                        starting,
+                        running,
                         network.engineId().orElseThrow(),
                         volumes.values().stream().map(value -> value.engineId().orElseThrow()).toList(),
                         views);
             } catch (DockerOperationCancelledException cancellationFailure) {
-                finishCancelledStart(starting, ownership, cancellationFailure);
+                if (committedRun == null) {
+                    finishCancelledStart(starting, ownership, cancellationFailure);
+                } else {
+                    finishCancelledCommittedRun(committedRun, ownership, cancellationFailure);
+                }
                 throw cancellationFailure;
             } catch (RuntimeException failure) {
-                try {
-                    cleanupEphemeralResources(ownership, CancellationToken.NONE);
-                } catch (RuntimeException cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
+                if (committedRun == null) {
+                    finishFailedStart(starting, ownership, failure);
+                } else {
+                    finishFailedCommittedRun(committedRun, ownership, failure);
                 }
-                labs.compareAndSetState(
-                        starting.id(), starting.revision(), LabState.STARTING, LabState.FAILED, now());
                 throw failure;
             }
         } finally {
+            activeStarts.remove(requestedLab.id(), operation);
             unlock(lock);
         }
     }
@@ -209,54 +309,67 @@ public class DockerLabLifecycle {
         if (labId == null || labId.isBlank()) {
             throw new IllegalArgumentException("The lab ID is required.");
         }
-        ReentrantLock lock = lockFor(labId);
-        lock.lock();
+        registerStopRequest(labId);
         try {
-            LabRecord current = labs.findById(labId)
-                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
-            LabState cleanupState = current.state();
-            LabRecord stopping = current;
-            if (Set.of(LabState.STARTING, LabState.RUNNING).contains(current.state())) {
-                Instant transitionTime = now();
-                stopping = current.transitionTo(LabState.STOPPING, transitionTime);
-                if (!labs.compareAndSetState(
-                        current.id(), current.revision(), current.state(), LabState.STOPPING, transitionTime)) {
-                    throw new IllegalStateException("Another lab operation won the stop race.");
-                }
-                cleanupState = LabState.STOPPING;
-            } else if (current.state() == LabState.IMPORTED) {
-                Instant transitionTime = now();
-                LabRecord stopped = current.transitionTo(LabState.STOPPED, transitionTime);
-                if (!labs.compareAndSetState(
-                        current.id(), current.revision(), LabState.IMPORTED, LabState.STOPPED, transitionTime)) {
-                    throw new IllegalStateException("Another lab operation won the stop race.");
-                }
-                return stopped;
-            } else if (current.state() == LabState.STOPPED) {
-                return current;
-            } else if (current.state() != LabState.FAILED) {
-                throw new IllegalStateException("The lab cannot stop from its current state.");
+            ActiveStart active = activeStarts.get(labId);
+            if (active != null) {
+                active.cancel();
             }
-
-            LabOwnership ownership = new LabOwnership(stopping.id(), stopping.projectId());
+            runtimeMonitor.cancel(labId);
+            ReentrantLock lock = lockFor(labId);
+            lock.lock();
             try {
-                cleanupEphemeralResources(ownership, CancellationToken.NONE);
-                Instant stoppedAt = now();
-                LabRecord stopped = stopping.transitionTo(LabState.STOPPED, stoppedAt);
-                if (!labs.compareAndSetState(
-                        stopping.id(), stopping.revision(), cleanupState, LabState.STOPPED, stoppedAt)) {
-                    throw new IllegalStateException("The stopped lab state could not be stored.");
+                LabRecord current = labs.findById(labId)
+                        .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+                LabState cleanupState = current.state();
+                LabRecord stopping = current;
+                if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
+                    Instant transitionTime = now();
+                    stopping = current.transitionTo(LabState.STOPPING, transitionTime);
+                    if (!labs.compareAndSetState(
+                            current.id(), current.revision(), current.state(), LabState.STOPPING, transitionTime)) {
+                        throw new IllegalStateException("Another lab operation won the stop race.");
+                    }
+                    cleanupState = LabState.STOPPING;
+                } else if (current.state() == LabState.IMPORTED) {
+                    Instant transitionTime = now();
+                    LabRecord stopped = current.transitionTo(LabState.STOPPED, transitionTime);
+                    if (!labs.compareAndSetState(
+                            current.id(), current.revision(), LabState.IMPORTED, LabState.STOPPED, transitionTime)) {
+                        throw new IllegalStateException("Another lab operation won the stop race.");
+                    }
+                    return stopped;
+                } else if (current.state() == LabState.STOPPED) {
+                    return current;
+                } else {
+                    throw new IllegalStateException("The lab cannot stop from its current state.");
                 }
-                return stopped;
-            } catch (RuntimeException failure) {
-                if (cleanupState == LabState.STOPPING) {
-                    labs.compareAndSetState(
-                            stopping.id(), stopping.revision(), LabState.STOPPING, LabState.FAILED, now());
+
+                LabOwnership ownership = new LabOwnership(stopping.id(), stopping.projectId());
+                try {
+                    cleanupEphemeralResources(ownership, CancellationToken.NONE);
+                    Instant stoppedAt = now();
+                    LabRecord stopped = stopping.transitionTo(LabState.STOPPED, stoppedAt);
+                    if (!labs.compareAndSetState(
+                            stopping.id(), stopping.revision(), cleanupState, LabState.STOPPED, stoppedAt)) {
+                        throw new IllegalStateException("The stopped lab state could not be stored.");
+                    }
+                    return stopped;
+                } catch (RuntimeException failure) {
+                    if (cleanupState == LabState.STOPPING) {
+                        storeFailure(
+                                stopping,
+                                LabFailureCode.CLEANUP_INCOMPLETE,
+                                Optional.empty(),
+                                true);
+                    }
+                    throw failure;
                 }
-                throw failure;
+            } finally {
+                unlock(lock);
             }
         } finally {
-            unlock(lock);
+            clearStopRequest(labId);
         }
     }
 
@@ -452,25 +565,296 @@ public class DockerLabLifecycle {
         if (!stoppingStored) {
             cancellationFailure.addSuppressed(
                     new IllegalStateException("The cancelled lab could not enter the stopping state."));
+            return;
         }
         try {
             cleanupEphemeralResources(ownership, CancellationToken.NONE);
         } catch (RuntimeException cleanupFailure) {
             cancellationFailure.addSuppressed(cleanupFailure);
-            if (stoppingStored) {
-                labs.compareAndSetState(
-                        stopping.id(), stopping.revision(), LabState.STOPPING, LabState.FAILED, now());
-            }
+            storeFailure(
+                    stopping,
+                    LabFailureCode.CLEANUP_INCOMPLETE,
+                    Optional.empty(),
+                    true);
             return;
         }
-        if (stoppingStored) {
-            Instant stoppedAt = now();
+        Instant stoppedAt = now();
+        if (!labs.compareAndSetState(
+                stopping.id(), stopping.revision(), LabState.STOPPING, LabState.STOPPED, stoppedAt)) {
+            cancellationFailure.addSuppressed(
+                    new IllegalStateException("The cancelled lab cleanup state could not be stored."));
+        }
+    }
+
+    private void finishCancelledCommittedRun(
+            LabRecord running,
+            LabOwnership ownership,
+            DockerOperationCancelledException cancellationFailure) {
+        runtimeMonitor.cancel(running.id());
+        Instant stoppingAt = now();
+        LabRecord stopping = running.transitionTo(LabState.STOPPING, stoppingAt);
+        if (!labs.compareAndSetState(
+                running.id(), running.revision(), LabState.RUNNING, LabState.STOPPING, stoppingAt)) {
+            cancellationFailure.addSuppressed(
+                    new IllegalStateException("The cancelled running lab could not enter the stopping state."));
+            return;
+        }
+        try {
+            cleanupEphemeralResources(ownership, CancellationToken.NONE);
+        } catch (RuntimeException cleanupFailure) {
+            cancellationFailure.addSuppressed(cleanupFailure);
+            storeFailure(
+                    stopping,
+                    LabFailureCode.CLEANUP_INCOMPLETE,
+                    Optional.empty(),
+                    true);
+            return;
+        }
+        Instant stoppedAt = now();
+        if (!labs.compareAndSetState(
+                stopping.id(), stopping.revision(), LabState.STOPPING, LabState.STOPPED, stoppedAt)) {
+            cancellationFailure.addSuppressed(
+                    new IllegalStateException("The cancelled running lab cleanup state could not be stored."));
+        }
+    }
+
+    private void finishFailedStart(
+            LabRecord starting, LabOwnership ownership, RuntimeException failure) {
+        Instant stoppingAt = now();
+        LabRecord stopping = starting.transitionTo(LabState.STOPPING, stoppingAt);
+        if (!labs.compareAndSetState(
+                starting.id(), starting.revision(), LabState.STARTING, LabState.STOPPING, stoppingAt)) {
+            failure.addSuppressed(
+                    new IllegalStateException("The failed lab could not claim the stopping state."));
+            return;
+        }
+        boolean cleanupIncomplete = false;
+        try {
+            cleanupEphemeralResources(ownership, CancellationToken.NONE);
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+            cleanupIncomplete = true;
+        }
+        FailureClassification classification = classify(failure);
+        if (!storeFailure(
+                stopping,
+                classification.code(),
+                classification.service(),
+                cleanupIncomplete)) {
+            failure.addSuppressed(
+                    new IllegalStateException("The failed lab state could not be stored."));
+        }
+    }
+
+    private void finishFailedCommittedRun(
+            LabRecord running, LabOwnership ownership, RuntimeException failure) {
+        runtimeMonitor.cancel(running.id());
+        Instant stoppingAt = now();
+        LabRecord stopping = running.transitionTo(LabState.STOPPING, stoppingAt);
+        if (!labs.compareAndSetState(
+                running.id(), running.revision(), LabState.RUNNING, LabState.STOPPING, stoppingAt)) {
+            failure.addSuppressed(
+                    new IllegalStateException("The failed running lab could not claim the stopping state."));
+            return;
+        }
+        boolean cleanupIncomplete = false;
+        try {
+            cleanupEphemeralResources(ownership, CancellationToken.NONE);
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+            cleanupIncomplete = true;
+        }
+        FailureClassification classification = classify(failure);
+        if (!storeFailure(
+                stopping,
+                classification.code(),
+                classification.service(),
+                cleanupIncomplete)) {
+            failure.addSuppressed(
+                    new IllegalStateException("The failed running lab state could not be stored."));
+        }
+    }
+
+    private void handleRuntimeFailure(
+            LabRecord monitoredRun,
+            LabOwnership ownership,
+            DockerRuntimeMonitorPort.RuntimeFailure failure) {
+        ReentrantLock lock = lockFor(monitoredRun.id());
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(monitoredRun.id()).orElse(null);
+            if (current == null
+                    || current.state() != LabState.RUNNING
+                    || current.revision() != monitoredRun.revision()
+                    || !current.projectId().equals(monitoredRun.projectId())) {
+                return;
+            }
+            Instant stoppingAt = now();
+            LabRecord stopping = current.transitionTo(LabState.STOPPING, stoppingAt);
             if (!labs.compareAndSetState(
-                    stopping.id(), stopping.revision(), LabState.STOPPING, LabState.STOPPED, stoppedAt)) {
-                cancellationFailure.addSuppressed(
-                        new IllegalStateException("The cancelled lab cleanup state could not be stored."));
+                    current.id(), current.revision(), LabState.RUNNING, LabState.STOPPING, stoppingAt)) {
+                return;
+            }
+            boolean cleanupIncomplete = false;
+            if (!failure.engineInspectionFailed() && !failure.ownershipMismatch()) {
+                try {
+                    cleanupEphemeralResources(ownership, CancellationToken.NONE);
+                } catch (RuntimeException ignored) {
+                    // Exact journal records remain available for an explicit stop retry.
+                    cleanupIncomplete = true;
+                }
+            }
+            FailureClassification classification;
+            if (failure.engineInspectionFailed()) {
+                classification = new FailureClassification(
+                        LabFailureCode.DOCKER_UNAVAILABLE, Optional.empty());
+            } else if (failure.ownershipMismatch()) {
+                classification = new FailureClassification(
+                        LabFailureCode.OWNERSHIP_MISMATCH, Optional.empty());
+                cleanupIncomplete = true;
+            } else {
+                classification = classify(failure.serviceFailure());
+            }
+            storeFailure(
+                    stopping,
+                    classification.code(),
+                    classification.service(),
+                    cleanupIncomplete);
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    @Override
+    public void close() {
+        runtimeMonitor.close();
+    }
+
+    private boolean storeFailure(
+            LabRecord stopping,
+            LabFailureCode code,
+            Optional<String> service,
+            boolean cleanupIncomplete) {
+        Instant failedAt = now();
+        LabRuntimeFailure failure = new LabRuntimeFailure(
+                stopping.id(),
+                stopping.revision() + 1,
+                code,
+                service,
+                failedAt,
+                cleanupIncomplete);
+        return labs.compareAndSetStateWithFailure(
+                stopping.id(),
+                stopping.revision(),
+                LabState.STOPPING,
+                failedAt,
+                failure);
+    }
+
+    private static FailureClassification classify(RuntimeException failure) {
+        if (hasCause(failure, DockerStorageFullException.class)) {
+            return new FailureClassification(
+                    LabFailureCode.DOCKER_STORAGE_FULL, Optional.empty());
+        }
+        if (hasCause(failure, DockerImagePullException.class)) {
+            return new FailureClassification(
+                    LabFailureCode.IMAGE_PULL_FAILED, Optional.empty());
+        }
+        if (failure instanceof DockerPortCollisionException collision) {
+            return new FailureClassification(
+                    LabFailureCode.HOST_PORT_IN_USE, Optional.of(collision.service()));
+        }
+        if (failure instanceof DockerServiceReadinessException readinessFailure) {
+            LabFailureCode code = switch (readinessFailure.reason()) {
+                case EXITED -> LabFailureCode.CONTAINER_EXITED;
+                case UNHEALTHY -> LabFailureCode.HEALTHCHECK_UNHEALTHY;
+                case TIMED_OUT -> LabFailureCode.STARTUP_TIMEOUT;
+                case HEALTH_NOT_REPORTED -> LabFailureCode.CONTAINER_START_FAILED;
+            };
+            return new FailureClassification(
+                    code, readinessFailure.services().stream().findFirst());
+        }
+        if (failure instanceof DockerOwnershipException) {
+            return new FailureClassification(
+                    LabFailureCode.OWNERSHIP_MISMATCH, Optional.empty());
+        }
+        return new FailureClassification(
+                LabFailureCode.CONTAINER_START_FAILED, Optional.empty());
+    }
+
+    private static boolean hasCause(RuntimeException failure, Class<? extends RuntimeException> type) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (type.isInstance(current)) {
+                return true;
             }
         }
+        return false;
+    }
+
+    private static Map<String, ServiceDockerPolicy> compileDockerPolicies(ManifestPlan plan) {
+        List<ServicePlan> orderedServices = plan.services().stream()
+                .sorted(java.util.Comparator.comparing(ServicePlan::id))
+                .toList();
+        if (orderedServices.stream().map(ServicePlan::id).distinct().count()
+                != orderedServices.size()) {
+            throw new IllegalArgumentException("Manifest service IDs must be unique.");
+        }
+        int serviceCount = orderedServices.size();
+        long totalMemory = plan.resources().memoryBytes();
+        long totalNanoCpus = plan.resources().cpus().movePointRight(9).longValueExact();
+        long memoryPerService = totalMemory / serviceCount;
+        long memoryRemainder = totalMemory % serviceCount;
+        long nanoCpusPerService = totalNanoCpus / serviceCount;
+        long nanoCpusRemainder = totalNanoCpus % serviceCount;
+        Map<Integer, String> fixedPorts = new TreeMap<>();
+        Map<String, ServiceDockerPolicy> policies = new TreeMap<>();
+        for (int serviceIndex = 0; serviceIndex < serviceCount; serviceIndex++) {
+            ServicePlan service = orderedServices.get(serviceIndex);
+            DockerContainerSpec.ResourceLimits resources = new DockerContainerSpec.ResourceLimits(
+                    memoryPerService + (serviceIndex < memoryRemainder ? 1 : 0),
+                    nanoCpusPerService + (serviceIndex < nanoCpusRemainder ? 1 : 0));
+            List<DockerContainerSpec.PublishedPort> ports = service.definition().ports().stream()
+                    .map(port -> new DockerContainerSpec.PublishedPort(
+                            port.container(), port.host(), port.protocol()))
+                    .toList();
+            for (DockerContainerSpec.PublishedPort port : ports) {
+                port.hostPort().ifPresent(hostPort -> {
+                    String first = fixedPorts.putIfAbsent(hostPort, service.id());
+                    if (first != null && !first.equals(service.id())) {
+                        throw new IllegalArgumentException(
+                                "Host port " + hostPort + " is requested by services '"
+                                        + first + "' and '" + service.id() + "'.");
+                    }
+                });
+            }
+            Optional<DockerContainerSpec.HealthProbe> health = service.definition().healthcheck()
+                    .map(value -> new DockerContainerSpec.HealthProbe(
+                            value.command(),
+                            value.interval(),
+                            value.timeout(),
+                            value.retries(),
+                            value.startPeriod()));
+            policies.put(service.id(), new ServiceDockerPolicy(ports, resources, health));
+        }
+        return Collections.unmodifiableMap(policies);
+    }
+
+    private static Duration readinessTimeout(List<PlannedContainer> containers) {
+        Duration minimum = Duration.ofSeconds(30);
+        Duration maximum = Duration.ofMinutes(15);
+        boolean imageHealthTimingUnknown = containers.stream().anyMatch(container ->
+                container.specification().healthProbe().isEmpty()
+                        && container.specification().imageHealthCheckConfigured());
+        if (imageHealthTimingUnknown) {
+            return maximum;
+        }
+        Duration healthBudget = containers.stream()
+                .flatMap(container -> container.specification().healthProbe().stream())
+                .map(DockerContainerSpec.HealthProbe::readinessBudget)
+                .max(Duration::compareTo)
+                .orElse(Duration.ZERO);
+        Duration bounded = healthBudget.compareTo(minimum) < 0 ? minimum : healthBudget;
+        return bounded.compareTo(maximum) > 0 ? maximum : bounded;
     }
 
     private static void preflightWorkspaceTargets(ManifestPlan plan) {
@@ -517,6 +901,14 @@ public class DockerLabLifecycle {
         return labLocks.computeIfAbsent(labId, ignored -> new ReentrantLock());
     }
 
+    private void registerStopRequest(String labId) {
+        stopRequests.merge(labId, 1, (current, added) -> Math.addExact(current, added));
+    }
+
+    private void clearStopRequest(String labId) {
+        stopRequests.computeIfPresent(labId, (ignored, count) -> count == 1 ? null : count - 1);
+    }
+
     private void unlock(ReentrantLock lock) {
         lock.unlock();
     }
@@ -528,5 +920,56 @@ public class DockerLabLifecycle {
             random.nextBytes(token);
             return HexFormat.of().formatHex(token);
         };
+    }
+
+    private record ServiceDockerPolicy(
+            List<DockerContainerSpec.PublishedPort> ports,
+            DockerContainerSpec.ResourceLimits resources,
+            Optional<DockerContainerSpec.HealthProbe> healthProbe) {
+
+        private ServiceDockerPolicy {
+            ports = List.copyOf(ports);
+            Objects.requireNonNull(resources, "resources");
+            healthProbe = healthProbe == null ? Optional.empty() : healthProbe;
+        }
+    }
+
+    private record PlannedContainer(
+            DockerResourceRecord resource, DockerContainerSpec specification) {
+        private PlannedContainer {
+            Objects.requireNonNull(resource, "resource");
+            Objects.requireNonNull(specification, "specification");
+        }
+    }
+
+    private record FailureClassification(
+            LabFailureCode code, Optional<String> service) {
+        private FailureClassification {
+            Objects.requireNonNull(code, "code");
+            service = service == null ? Optional.empty() : service;
+        }
+    }
+
+    private static final class ActiveStart implements CancellationToken {
+        private final CancellationToken external;
+        private final AtomicBoolean stopRequested = new AtomicBoolean();
+
+        private ActiveStart(CancellationToken external) {
+            this.external = Objects.requireNonNull(external, "external");
+        }
+
+        @Override
+        public boolean isCancellationRequested() {
+            return stopRequested.get() || external.isCancellationRequested();
+        }
+
+        private synchronized boolean commitRunning(BooleanSupplier commit) {
+            throwIfCancellationRequested();
+            return commit.getAsBoolean();
+        }
+
+        private synchronized void cancel() {
+            stopRequested.set(true);
+        }
     }
 }

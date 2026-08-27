@@ -195,6 +195,13 @@ class SQLitePersistenceIntegrationTests {
                     "stderr",
                     "stdout_truncated",
                     "stderr_truncated");
+            assertThat(columnNames(jdbc, "lab_runtime_failure")).containsExactly(
+                    "lab_id",
+                    "lab_revision",
+                    "failure_code",
+                    "service_id",
+                    "occurred_at_epoch_ms",
+                    "cleanup_incomplete");
         }
 
         String databaseBytes = Files.readString(
@@ -243,7 +250,7 @@ class SQLitePersistenceIntegrationTests {
                     .validateOnMigrate(true)
                     .load();
             flyway.migrate();
-            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
+            assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
             return dataSource;
         } catch (RuntimeException | AssertionError exception) {
             dataSource.close();
