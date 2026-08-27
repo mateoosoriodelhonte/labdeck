@@ -137,7 +137,11 @@ public final class LabApiModels {
             String apiVersion,
             String labId,
             long revision,
-            List<ServiceStatusResponse> services) {
+            Instant observedAt,
+            List<ServiceStatusResponse> services,
+            TopologyResponse topology,
+            StorageResponse storage,
+            CleanupPlanResponse cleanupPlan) {
         public ServiceListResponse {
             services = List.copyOf(services);
         }
@@ -145,16 +149,78 @@ public final class LabApiModels {
 
     public record ServiceStatusResponse(
             String service,
+            String containerName,
             String image,
             String status,
             boolean running,
             Integer exitCode,
             String health,
+            Instant startedAt,
+            Long uptimeSeconds,
+            ServiceMetricsResponse metrics,
+            Long imageSizeBytes,
+            Long writableLayerBytes,
             List<PortMappingResponse> ports) {
         public ServiceStatusResponse {
             ports = List.copyOf(ports);
         }
     }
+
+    public record ServiceMetricsResponse(
+            String availability,
+            Double cpuPercent,
+            Long memoryUsageBytes,
+            Long memoryLimitBytes,
+            Long networkReadBytes,
+            Long networkWriteBytes) {}
+
+    public record TopologyResponse(
+            List<TopologyNodeResponse> nodes,
+            List<TopologyEdgeResponse> edges) {
+        public TopologyResponse {
+            nodes = List.copyOf(nodes);
+            edges = List.copyOf(edges);
+        }
+    }
+
+    public record TopologyNodeResponse(String id, String kind, String label, String state) {}
+
+    public record TopologyEdgeResponse(
+            String id, String kind, String from, String to, Integer port, String target) {}
+
+    public record StorageResponse(
+            List<ImageUseResponse> images,
+            List<VolumeUseResponse> volumes,
+            long knownWritableBytes,
+            boolean writableEstimateComplete,
+            boolean hasUnknownVolumeSizes) {
+        public StorageResponse {
+            images = List.copyOf(images);
+            volumes = List.copyOf(volumes);
+        }
+    }
+
+    public record ImageUseResponse(
+            String service,
+            String reference,
+            Long sizeBytes,
+            boolean shared,
+            boolean reclaimable) {}
+
+    public record VolumeUseResponse(
+            String name, Long sizeBytes, String sizeAvailability, String cleanupAction) {}
+
+    public record CleanupPlanResponse(
+            boolean readOnly,
+            long estimatedReclaimableBytes,
+            boolean estimateComplete,
+            List<CleanupActionResponse> actions) {
+        public CleanupPlanResponse {
+            actions = List.copyOf(actions);
+        }
+    }
+
+    public record CleanupActionResponse(String kind, String resource, String action) {}
 
     public record PortMappingResponse(
             int containerPort,
@@ -185,6 +251,7 @@ public final class LabApiModels {
     public record LogListResponse(
             String apiVersion,
             String labId,
+            String service,
             String capability,
             List<LogLineResponse> lines,
             boolean truncated) {

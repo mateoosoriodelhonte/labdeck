@@ -9,6 +9,7 @@ import java.util.Optional;
 
 public record DockerContainerSpec(
         String image,
+        String imageReference,
         String workingDirectory,
         List<String> command,
         Map<String, String> environment,
@@ -23,6 +24,7 @@ public record DockerContainerSpec(
 
     public DockerContainerSpec {
         requireText(image, "image", 255);
+        requireText(imageReference, "image reference", 255);
         requireAbsoluteContainerPath(workingDirectory, "working directory");
         command = List.copyOf(command);
         if (command.size() > 64 || command.stream().anyMatch(value -> value == null || value.isEmpty())) {
@@ -64,6 +66,7 @@ public record DockerContainerSpec(
     @Override
     public String toString() {
         return "DockerContainerSpec[image=" + image
+                + ", imageReference=" + imageReference
                 + ", workingDirectory=" + workingDirectory
                 + ", commandItems=" + command.size()
                 + ", environmentKeys=" + new java.util.TreeSet<>(environment.keySet())

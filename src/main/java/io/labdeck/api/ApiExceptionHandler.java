@@ -1,9 +1,12 @@
 package io.labdeck.api;
 
 import io.labdeck.docker.DockerEngineCapabilityException;
+import io.labdeck.docker.DockerActiveServiceNotFoundException;
 import io.labdeck.docker.DockerImagePullException;
+import io.labdeck.docker.DockerLogAccessException;
 import io.labdeck.docker.DockerImagesRequiredException;
 import io.labdeck.docker.DockerOperationCancelledException;
+import io.labdeck.docker.DockerObservationTimeoutException;
 import io.labdeck.docker.DockerOwnershipException;
 import io.labdeck.docker.DockerPortCollisionException;
 import io.labdeck.docker.DockerServiceReadinessException;
@@ -168,6 +171,36 @@ public class ApiExceptionHandler {
                 HttpStatus.SERVICE_UNAVAILABLE,
                 "DOCKER_" + exception.reason().name(),
                 title,
+                exception.getMessage(),
+                Map.of());
+    }
+
+    @ExceptionHandler(DockerActiveServiceNotFoundException.class)
+    ResponseEntity<ProblemDetail> inactiveService(DockerActiveServiceNotFoundException exception) {
+        return problem(
+                HttpStatus.NOT_FOUND,
+                "LAB_SERVICE_NOT_ACTIVE",
+                "Lab service is not active",
+                exception.getMessage(),
+                Map.of());
+    }
+
+    @ExceptionHandler(DockerLogAccessException.class)
+    ResponseEntity<ProblemDetail> logAccess(DockerLogAccessException exception) {
+        return problem(
+                HttpStatus.BAD_GATEWAY,
+                "DOCKER_LOGS_UNAVAILABLE",
+                "Docker logs are unavailable",
+                exception.getMessage(),
+                Map.of());
+    }
+
+    @ExceptionHandler(DockerObservationTimeoutException.class)
+    ResponseEntity<ProblemDetail> observationTimeout(DockerObservationTimeoutException exception) {
+        return problem(
+                HttpStatus.GATEWAY_TIMEOUT,
+                "DOCKER_OBSERVATION_TIMEOUT",
+                "Docker observation timed out",
                 exception.getMessage(),
                 Map.of());
     }

@@ -55,15 +55,17 @@ has the form `sha256:` followed by 64 lowercase hexadecimal characters.
 | `GET` | `/labs/{id}` | Lab state, safe manifest plan, and safe runtime failure |
 | `POST` | `/labs/{id}/start` | Start the exact reviewed revision and manifest plan |
 | `POST` | `/labs/{id}/stop` | Stop the exact reviewed lab revision |
-| `GET` | `/labs/{id}/services` | Inspect active, journaled, label-verified service containers |
-| `GET` | `/labs/{id}/logs` | Typed placeholder with `capability: PLANNED` until issue #8 |
+| `GET` | `/labs/{id}/services` | Bounded status, metrics, topology, storage, and cleanup plan for exact-owned resources |
+| `GET` | `/labs/{id}/logs?service=app&tail=200` | Bounded log history for one active exact-owned service |
+| `GET` | `/labs/{id}/logs/stream?service=app&tail=100` | Bounded server-sent log stream for one active exact-owned service |
 | `GET` | `/labs/{id}/tests?limit=20` | Recent bounded test results; limit is 1 through 100 |
 | `GET` | `/templates` | Typed placeholder with `capability: PLANNED` until issue #10 |
 | `GET` | `/settings` | Read-only local security and capability settings |
 
 Test execution is not part of this issue. Issue #9 will add the constrained mutation that runs
 only the manifest-defined argv inside an owned service. The current `/tests` contract is read-only
-history. Logs and templates are also marked `PLANNED` instead of returning invented data.
+history. Templates remain `PLANNED` instead of returning invented data. Settings report logs as
+`AVAILABLE`.
 
 ## Import a lab
 
@@ -108,10 +110,37 @@ IDs and Engine-generated names. Published ports have `hostAddress: 127.0.0.1` an
 as `127.0.0.1:5432`. The endpoint has no forced URL scheme because a service can use PostgreSQL,
 Redis, HTTP, or another TCP protocol.
 
-The live service list captures the lab revision and exact-owned containers under one lifecycle
-lock. It does not reload the mutable manifest. Its `image` value is `unavailable` until LabDeck
-stores a safe immutable display reference. This avoids showing a changed manifest reference or a
-private Docker image ID as if it described the running container.
+The live service list captures the lab revision and exact journal records under the per-lab lock.
+It releases that lock before Docker reads, applies a five-second aggregate deadline, then checks the
+lab revision again. Stop is therefore not blocked by a slow metrics request. A changed lab produces
+a `409` conflict instead of a stale snapshot.
+
+The response includes status, health, ports, start time, uptime, CPU, memory, network counters,
+image size, and writable-layer size when Docker reports them. It also includes stable topology
+nodes and edges, exact-owned named-volume mounts, storage availability, and a read-only cleanup
+plan. Docker Engine IDs, ownership tokens, host filesystem paths, environment values, container
+commands, IP addresses, and private image IDs are not response fields.
+
+Named-volume size is `null` with `sizeAvailability: UNAVAILABLE`. Docker's per-volume inspect API
+does not report a size. LabDeck does not use Docker-wide disk discovery or start a helper container
+to guess it. `hasUnknownVolumeSizes` makes this limit explicit. Cleanup estimates include only
+known writable-layer bytes. The cleanup plan never proposes a general prune, image deletion, or
+named-volume deletion.
+
+New LabDeck containers use Docker's `local` log driver with compressed rotation: three files of up
+to 10 MiB each. Log history requires `service`; `tail` defaults to 200 and is limited to 1 through
+500. A history read covers at most 15 minutes, 500 lines, 256 KiB, and five seconds. The response
+uses `Cache-Control: no-store` and returns Docker timestamps when present. It strips control and
+format characters and limits each rendered line to 16,384 Unicode code points.
+
+The server-sent stream requires the same exact active service. Its initial tail defaults to 100 and
+is limited to 1 through 200. A stream ends after five minutes, 2,000 lines, 1 MiB, client disconnect,
+queue overflow, Stop, restart, runtime failure, or application shutdown. The queue holds at most
+128 events and 256 KiB. LabDeck allows at most two streams per lab and four per process. It sends a
+keepalive comment every 15 seconds while Docker is quiet, followed by an `end` event with a bounded
+reason. The lab, active service, ownership, and Docker log attachment are checked before HTTP 200 is
+committed. A stopped or replaced service releases its stream slot as soon as the Docker subscription
+closes. A Docker transport failure ends with reason `ERROR`.
 
 ## Stop a lab
 
@@ -164,11 +193,16 @@ Common codes include:
 | `409` | `MANIFEST_CHANGED` | The manifest plan hash changed |
 | `409` | `IMAGE_CONFIRMATION_REQUIRED` | Public images need explicit confirmation |
 | `409` | `DOCKER_OWNERSHIP_MISMATCH` | Stored and actual Docker ownership do not match |
+| `404` | `LAB_SERVICE_NOT_ACTIVE` | The selected service is not active in the selected lab |
 | `415` | `JSON_REQUIRED` | A mutation did not use JSON |
 | `422` | `MANIFEST_INVALID` | The restricted manifest failed validation |
+| `429` | `LOG_STREAM_LIMIT_REACHED` | The local log stream bound is already in use |
+| `502` | `DOCKER_LOGS_UNAVAILABLE` | Docker could not provide the selected service logs safely |
 | `503` | `DOCKER_UNAVAILABLE` | Install or start the local Docker engine |
+| `503` | `LOG_STREAM_UNAVAILABLE` | The bounded local stream worker is unavailable |
 | `503` | `DOCKER_VERSION_UNSUPPORTED` | Update Docker Engine for safe local port publishing |
 | `503` | `DOCKER_RESOURCE_LIMITS_UNSUPPORTED` | Docker cannot enforce the required resource limits |
+| `504` | `DOCKER_OBSERVATION_TIMEOUT` | Docker observation exceeded the five-second deadline |
 | `507` | `DOCKER_STORAGE_FULL` | Docker storage is full; LabDeck did not prune it |
 
 ## Browser policy

@@ -15,6 +15,7 @@ import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.LogConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
@@ -24,13 +25,16 @@ import com.github.dockerjava.core.DockerClientImpl;
 import com.github.dockerjava.transport.DockerHttpClient;
 import java.io.IOException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -38,6 +42,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -47,6 +52,16 @@ public class DockerJavaLabEngine implements DockerEnginePort {
 
     private static final Pattern VOLUME_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]{0,254}");
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final int MAX_LOG_TAIL = 500;
+    private static final int MAX_LOG_LINE_CHARS = 16_384;
+    private static final int LOG_HISTORY_BYTES = 256 * 1_024;
+    private static final int LOG_STREAM_LINES = 2_000;
+    private static final int LOG_STREAM_BYTES = 1_024 * 1_024;
+    private static final Duration LOG_HISTORY_TIMEOUT = Duration.ofSeconds(5);
+    private static final Map<String, String> LOG_OPTIONS = Map.of(
+            "max-size", "10m",
+            "max-file", "3",
+            "compress", "true");
 
     private final DockerClient docker;
     private final DockerHttpClient http;
@@ -335,11 +350,14 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withAutoRemove(false)
                 .withPrivileged(false)
                 .withPublishAllPorts(false)
+                .withLogConfig(new LogConfig(LogConfig.LoggingType.LOCAL, LOG_OPTIONS))
                 .withRestartPolicy(RestartPolicy.noRestart());
+        Map<String, String> labels = new java.util.LinkedHashMap<>(dispatched.labels());
+        labels.put(LabOwnership.IMAGE_REFERENCE_LABEL, specification.imageReference());
         CreateContainerCmd command = docker.createContainerCmd(specification.image())
                 .withAuthConfig(new AuthConfig())
                 .withName(engineName(dispatched))
-                .withLabels(dispatched.labels())
+                .withLabels(Map.copyOf(labels))
                 .withAliases(dispatched.logicalName())
                 .withWorkingDir(specification.workingDirectory())
                 .withEnv(environment(specification.environment()))
@@ -401,6 +419,98 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         return new DockerContainerView(
                 inspection.getId(), active.logicalName(), name, image, status, running,
                 exitCode, health, inspectSnapshotPublishedPorts(inspection));
+    }
+
+    @Override
+    public DockerServiceObservation inspectContainerObservation(
+            DockerResourceRecord active, Map<String, String> ownedVolumes) {
+        requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        Objects.requireNonNull(ownedVolumes, "ownedVolumes");
+        InspectContainerResponse inspection = inspectOwnedContainer(active);
+        DockerContainerView container = snapshotView(active, inspection);
+        Optional<String> imageReference = safeImageReference(inspection);
+        OptionalLong imageSize = inspectImageSize(inspection);
+        OptionalLong writableSize = inspectWritableLayerSize(active);
+        DockerContainerMetrics metrics = inspectMetrics(active, inspection, container.running());
+        return new DockerServiceObservation(
+                container,
+                imageReference,
+                metrics,
+                imageSize,
+                writableSize,
+                observedVolumeMounts(inspection, ownedVolumes));
+    }
+
+    private static List<DockerVolumeMountObservation> observedVolumeMounts(
+            InspectContainerResponse inspection, Map<String, String> ownedVolumes) {
+        if (inspection.getMounts() == null || inspection.getMounts().isEmpty()) {
+            return List.of();
+        }
+        List<DockerVolumeMountObservation> mounts = new ArrayList<>();
+        for (InspectContainerResponse.Mount mount : inspection.getMounts()) {
+            String engineName = mount == null ? null : mount.getName();
+            String logicalName = engineName == null ? null : ownedVolumes.get(engineName);
+            if (logicalName == null) {
+                continue;
+            }
+            if (mount.getDestination() == null) {
+                throw new DockerOwnershipException(
+                        "Docker did not report the owned volume mount target.");
+            }
+            mounts.add(new DockerVolumeMountObservation(
+                    logicalName,
+                    mount.getDestination().getPath(),
+                    !Boolean.TRUE.equals(mount.getRW())));
+        }
+        return mounts.stream()
+                .sorted(java.util.Comparator.comparing(DockerVolumeMountObservation::volume)
+                        .thenComparing(DockerVolumeMountObservation::target))
+                .toList();
+    }
+
+    @Override
+    public DockerVolumeObservation inspectVolumeObservation(DockerResourceRecord active) {
+        requireType(active, DockerResourceType.VOLUME, DockerResourceState.ACTIVE);
+        inspectOwnedVolume(active);
+        return new DockerVolumeObservation(
+                active.logicalName(), OptionalLong.empty(), "UNAVAILABLE");
+    }
+
+    @Override
+    public void verifyNetwork(DockerResourceRecord active) {
+        requireType(active, DockerResourceType.NETWORK, DockerResourceState.ACTIVE);
+        inspectOwnedNetwork(active);
+    }
+
+    @Override
+    public DockerLogBatch readContainerLogs(DockerResourceRecord active, int tail) {
+        requireLogRequest(active, tail);
+        List<DockerLogLine> lines = new ArrayList<>();
+        BoundedDockerLogCallback callback = openLogCallback(
+                active, tail, false, tail, LOG_HISTORY_BYTES, lines::add);
+        try {
+            boolean completed = callback.await(LOG_HISTORY_TIMEOUT);
+            if (!completed) {
+                callback.markTruncated();
+            }
+            callback.close();
+            callback.throwIfFailed();
+            return new DockerLogBatch(lines, callback.truncated());
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new DockerLogAccessException();
+        } finally {
+            callback.close();
+        }
+    }
+
+    @Override
+    public DockerLogSubscription followContainerLogs(
+            DockerResourceRecord active, int tail, Consumer<DockerLogLine> consumer) {
+        requireLogRequest(active, tail);
+        Objects.requireNonNull(consumer, "consumer");
+        return openLogCallback(
+                active, tail, true, LOG_STREAM_LINES, LOG_STREAM_BYTES, consumer);
     }
 
     @Override
@@ -576,6 +686,9 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             InspectContainerResponse actual, DockerContainerSpec expected) {
         if (actual.getConfig() == null
                 || !expected.image().equals(actual.getConfig().getImage())
+                || actual.getConfig().getLabels() == null
+                || !expected.imageReference().equals(
+                        actual.getConfig().getLabels().get(LabOwnership.IMAGE_REFERENCE_LABEL))
                 || actual.getHostConfig() == null
                 || !expected.networkId().equals(actual.getHostConfig().getNetworkMode())
                 || !Long.valueOf(expected.resourceLimits().memoryBytes())
@@ -585,9 +698,12 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 || !Long.valueOf(expected.resourceLimits().nanoCpus())
                         .equals(actual.getHostConfig().getNanoCPUs())
                 || Boolean.TRUE.equals(actual.getHostConfig().getPublishAllPorts())
-                || Boolean.TRUE.equals(actual.getHostConfig().getOomKillDisable())) {
+                || Boolean.TRUE.equals(actual.getHostConfig().getOomKillDisable())
+                || actual.getHostConfig().getLogConfig() == null
+                || actual.getHostConfig().getLogConfig().getType() != LogConfig.LoggingType.LOCAL
+                || !LOG_OPTIONS.equals(actual.getHostConfig().getLogConfig().getConfig())) {
             throw new DockerOwnershipException(
-                    "Docker created a container with different image, network, or resource limits than planned.");
+                    "Docker created a container with different image, network, logging, or resource limits than planned.");
         }
         requirePortBindingShape(actual, expected);
         requireHealthCheckShape(actual, expected);
@@ -704,6 +820,218 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             case "unhealthy" -> DockerHealthStatus.UNHEALTHY;
             default -> DockerHealthStatus.UNKNOWN;
         };
+    }
+
+    private static DockerContainerView snapshotView(
+            DockerResourceRecord active, InspectContainerResponse inspection) {
+        var state = inspection.getState();
+        String status = state == null || state.getStatus() == null ? "unknown" : state.getStatus();
+        boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+        OptionalInt exitCode = !running && state != null && state.getExitCodeLong() != null
+                ? OptionalInt.of(Math.toIntExact(state.getExitCodeLong()))
+                : OptionalInt.empty();
+        DockerHealthStatus health = healthStatus(state == null ? null : state.getHealth());
+        String name = inspection.getName() == null ? "" : inspection.getName().replaceFirst("^/", "");
+        String image = inspection.getConfig() == null || inspection.getConfig().getImage() == null
+                ? "unknown" : inspection.getConfig().getImage();
+        return new DockerContainerView(
+                inspection.getId(), active.logicalName(), name, image, status, running,
+                exitCode, health, inspectSnapshotPublishedPorts(inspection));
+    }
+
+    private static Optional<String> safeImageReference(InspectContainerResponse inspection) {
+        Map<String, String> labels = inspection.getConfig() == null
+                ? null : inspection.getConfig().getLabels();
+        String reference = labels == null ? null : labels.get(LabOwnership.IMAGE_REFERENCE_LABEL);
+        if (reference == null
+                || reference.isBlank()
+                || reference.length() > 255
+                || !reference.equals(reference.strip())
+                || reference.codePoints().anyMatch(Character::isISOControl)) {
+            return Optional.empty();
+        }
+        return Optional.of(reference);
+    }
+
+    private OptionalLong inspectImageSize(InspectContainerResponse inspection) {
+        String image = inspection.getConfig() == null ? null : inspection.getConfig().getImage();
+        if (image == null || image.isBlank()) {
+            return OptionalLong.empty();
+        }
+        try {
+            Long size = docker.inspectImageCmd(image).exec().getSize();
+            return size == null || size < 0 ? OptionalLong.empty() : OptionalLong.of(size);
+        } catch (RuntimeException failure) {
+            return OptionalLong.empty();
+        }
+    }
+
+    private OptionalLong inspectWritableLayerSize(DockerResourceRecord active) {
+        try {
+            InspectContainerResponse sized = docker.inspectContainerCmd(active.engineId().orElseThrow())
+                    .withSize(true)
+                    .exec();
+            if (!active.hasExactLabels(
+                    sized.getConfig() == null ? null : sized.getConfig().getLabels())) {
+                throw ownershipMismatch();
+            }
+            Long size = sized.getSizeRw();
+            return size == null || size < 0 ? OptionalLong.empty() : OptionalLong.of(size);
+        } catch (DockerOwnershipException failure) {
+            throw failure;
+        } catch (RuntimeException failure) {
+            return OptionalLong.empty();
+        }
+    }
+
+    private DockerContainerMetrics inspectMetrics(
+            DockerResourceRecord active,
+            InspectContainerResponse inspection,
+            boolean running) {
+        Optional<Instant> startedAt = parseStartedAt(inspection);
+        if (!running) {
+            return new DockerContainerMetrics(
+                    OptionalDouble.empty(),
+                    OptionalLong.empty(),
+                    OptionalLong.empty(),
+                    OptionalLong.empty(),
+                    OptionalLong.empty(),
+                    startedAt);
+        }
+        var request = DockerHttpClient.Request.builder()
+                .method(DockerHttpClient.Request.Method.GET)
+                .path("/v1.44/containers/" + active.engineId().orElseThrow()
+                        + "/stats?stream=false&one-shot=true")
+                .build();
+        try (DockerHttpClient.Response response = http.execute(request)) {
+            if (response.getStatusCode() != 200) {
+                return metricsUnavailable(startedAt);
+            }
+            JsonNode stats = JSON.readTree(response.getBody());
+            return new DockerContainerMetrics(
+                    cpuPercent(stats),
+                    nonNegativeLong(stats, "memory_stats", "usage"),
+                    nonNegativeLong(stats, "memory_stats", "limit"),
+                    sumNetworkBytes(stats, "rx_bytes"),
+                    sumNetworkBytes(stats, "tx_bytes"),
+                    startedAt);
+        } catch (IOException | RuntimeException failure) {
+            return metricsUnavailable(startedAt);
+        }
+    }
+
+    private static DockerContainerMetrics metricsUnavailable(Optional<Instant> startedAt) {
+        return new DockerContainerMetrics(
+                OptionalDouble.empty(),
+                OptionalLong.empty(),
+                OptionalLong.empty(),
+                OptionalLong.empty(),
+                OptionalLong.empty(),
+                startedAt);
+    }
+
+    private static Optional<Instant> parseStartedAt(InspectContainerResponse inspection) {
+        String value = inspection.getState() == null ? null : inspection.getState().getStartedAt();
+        if (value == null || value.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            Instant parsed = Instant.parse(value);
+            return parsed.isBefore(Instant.EPOCH) ? Optional.empty() : Optional.of(parsed);
+        } catch (RuntimeException failure) {
+            return Optional.empty();
+        }
+    }
+
+    private static OptionalDouble cpuPercent(JsonNode stats) {
+        OptionalLong currentCpu = nonNegativeLong(stats, "cpu_stats", "cpu_usage", "total_usage");
+        OptionalLong priorCpu = nonNegativeLong(stats, "precpu_stats", "cpu_usage", "total_usage");
+        OptionalLong currentSystem = nonNegativeLong(stats, "cpu_stats", "system_cpu_usage");
+        OptionalLong priorSystem = nonNegativeLong(stats, "precpu_stats", "system_cpu_usage");
+        OptionalLong online = nonNegativeLong(stats, "cpu_stats", "online_cpus");
+        if (currentCpu.isEmpty() || priorCpu.isEmpty() || currentSystem.isEmpty()
+                || priorSystem.isEmpty() || online.isEmpty() || online.orElseThrow() == 0) {
+            return OptionalDouble.empty();
+        }
+        long cpuDelta = currentCpu.orElseThrow() - priorCpu.orElseThrow();
+        long systemDelta = currentSystem.orElseThrow() - priorSystem.orElseThrow();
+        if (cpuDelta < 0 || systemDelta <= 0) {
+            return OptionalDouble.empty();
+        }
+        double percent = ((double) cpuDelta / (double) systemDelta) * online.orElseThrow() * 100.0;
+        return Double.isFinite(percent) && percent >= 0
+                ? OptionalDouble.of(percent)
+                : OptionalDouble.empty();
+    }
+
+    private static OptionalLong nonNegativeLong(JsonNode root, String... fields) {
+        JsonNode current = root;
+        for (String field : fields) {
+            current = current == null ? null : current.get(field);
+        }
+        if (current == null || !current.isIntegralNumber() || !current.canConvertToLong()) {
+            return OptionalLong.empty();
+        }
+        long value = current.longValue();
+        return value < 0 ? OptionalLong.empty() : OptionalLong.of(value);
+    }
+
+    private static OptionalLong sumNetworkBytes(JsonNode stats, String field) {
+        JsonNode networks = stats == null ? null : stats.get("networks");
+        if (networks == null || !networks.isObject()) {
+            return OptionalLong.empty();
+        }
+        long total = 0;
+        boolean found = false;
+        var values = networks.elements();
+        while (values.hasNext()) {
+            OptionalLong value = nonNegativeLong(values.next(), field);
+            if (value.isPresent()) {
+                found = true;
+                try {
+                    total = Math.addExact(total, value.orElseThrow());
+                } catch (ArithmeticException overflow) {
+                    return OptionalLong.empty();
+                }
+            }
+        }
+        return found ? OptionalLong.of(total) : OptionalLong.empty();
+    }
+
+    private void requireLogRequest(DockerResourceRecord active, int tail) {
+        requireType(active, DockerResourceType.CONTAINER, DockerResourceState.ACTIVE);
+        if (tail < 1 || tail > MAX_LOG_TAIL) {
+            throw new IllegalArgumentException("The Docker log tail is not valid.");
+        }
+        inspectOwnedContainer(active);
+    }
+
+    private BoundedDockerLogCallback openLogCallback(
+            DockerResourceRecord active,
+            int tail,
+            boolean follow,
+            int maxLines,
+            int maxBytes,
+            Consumer<DockerLogLine> consumer) {
+        BoundedDockerLogCallback callback = new BoundedDockerLogCallback(
+                active.logicalName(), maxLines, maxBytes, MAX_LOG_LINE_CHARS, consumer);
+        try {
+            Instant now = Instant.now();
+            docker.logContainerCmd(active.engineId().orElseThrow())
+                    .withStdOut(true)
+                    .withStdErr(true)
+                    .withTimestamps(true)
+                    .withTail(tail)
+                    .withSince(Math.toIntExact(now.minus(Duration.ofMinutes(15)).getEpochSecond()))
+                    .withUntil(Math.toIntExact(now.plus(
+                            follow ? Duration.ofMinutes(5) : Duration.ZERO).getEpochSecond()))
+                    .withFollowStream(follow)
+                    .exec(callback);
+            return callback;
+        } catch (RuntimeException failure) {
+            callback.close();
+            throw new DockerLogAccessException();
+        }
     }
 
     private static List<DockerPortMapping> inspectPublishedPorts(

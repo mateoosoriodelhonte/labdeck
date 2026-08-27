@@ -80,10 +80,10 @@ class LabApiIntegrationTests {
         mvc.perform(get("/api/v1/labs/{id}/services", id))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.services.length()").value(0));
-        mvc.perform(get("/api/v1/labs/{id}/logs", id))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.capability").value("PLANNED"))
-                .andExpect(jsonPath("$.lines.length()").value(0));
+        mvc.perform(get("/api/v1/labs/{id}/logs", id)
+                        .queryParam("service", "api"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("LAB_SERVICE_NOT_ACTIVE"));
         mvc.perform(get("/api/v1/labs/{id}/tests?limit=20", id))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.runs.length()").value(0));

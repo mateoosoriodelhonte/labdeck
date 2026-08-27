@@ -97,7 +97,7 @@ public record DockerResourceRecord(
                 + ", ownership=" + ownership
                 + ", type=" + type
                 + ", logicalName=" + logicalName
-                + ", engineId=" + engineId
+                + ", engineId=" + (engineId.isPresent() ? "<redacted>" : "<none>")
                 + ", engineIdentity=" + (engineIdentity.isPresent() ? "<redacted>" : "<none>")
                 + ", state=" + state
                 + ", createdAt=" + createdAt

@@ -3,31 +3,43 @@ package io.labdeck.api;
 import static io.labdeck.api.LabApiModels.API_VERSION;
 
 import io.labdeck.api.LabApiModels.FailureResponse;
+import io.labdeck.api.LabApiModels.CleanupActionResponse;
+import io.labdeck.api.LabApiModels.CleanupPlanResponse;
 import io.labdeck.api.LabApiModels.ImageRequirementResponse;
+import io.labdeck.api.LabApiModels.ImageUseResponse;
 import io.labdeck.api.LabApiModels.LabDetailResponse;
 import io.labdeck.api.LabApiModels.LabListResponse;
 import io.labdeck.api.LabApiModels.LabStartResponse;
 import io.labdeck.api.LabApiModels.LabSummaryResponse;
 import io.labdeck.api.LabApiModels.LogListResponse;
+import io.labdeck.api.LabApiModels.LogLineResponse;
 import io.labdeck.api.LabApiModels.ManifestPlanResponse;
 import io.labdeck.api.LabApiModels.PortMappingResponse;
 import io.labdeck.api.LabApiModels.PortPlanResponse;
 import io.labdeck.api.LabApiModels.ResourcePlanResponse;
 import io.labdeck.api.LabApiModels.ServiceListResponse;
+import io.labdeck.api.LabApiModels.ServiceMetricsResponse;
 import io.labdeck.api.LabApiModels.ServicePlanResponse;
 import io.labdeck.api.LabApiModels.ServiceStatusResponse;
 import io.labdeck.api.LabApiModels.SettingsResponse;
+import io.labdeck.api.LabApiModels.StorageResponse;
 import io.labdeck.api.LabApiModels.StartLabRequest;
 import io.labdeck.api.LabApiModels.TemplateListResponse;
 import io.labdeck.api.LabApiModels.TestHistoryResponse;
 import io.labdeck.api.LabApiModels.TestPlanResponse;
 import io.labdeck.api.LabApiModels.TestRunResponse;
+import io.labdeck.api.LabApiModels.TopologyEdgeResponse;
+import io.labdeck.api.LabApiModels.TopologyNodeResponse;
+import io.labdeck.api.LabApiModels.TopologyResponse;
+import io.labdeck.api.LabApiModels.VolumeUseResponse;
 import io.labdeck.api.LabApiModels.VolumePlanResponse;
 import io.labdeck.docker.CancellationToken;
 import io.labdeck.docker.DockerContainerView;
 import io.labdeck.docker.DockerImagePlan;
 import io.labdeck.docker.DockerLabLifecycle;
-import io.labdeck.docker.DockerServiceSnapshot;
+import io.labdeck.docker.DockerLogBatch;
+import io.labdeck.docker.DockerObservabilitySnapshot;
+import io.labdeck.docker.DockerServiceObservation;
 import io.labdeck.docker.DockerStartResult;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
@@ -46,6 +58,7 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -222,12 +235,20 @@ public class LabApiService {
 
     public ServiceListResponse listServices(String id) {
         findLab(id);
-        DockerServiceSnapshot snapshot = lifecycle.inspectServiceSnapshot(id);
+        DockerObservabilitySnapshot snapshot = lifecycle.inspectObservabilitySnapshot(id);
+        Instant observedAt = clock.instant();
         List<ServiceStatusResponse> services = snapshot.services().stream()
-                .map(container -> service(container, "unavailable"))
+                .map(container -> service(container, observedAt))
                 .toList();
         return new ServiceListResponse(
-                API_VERSION, snapshot.lab().id(), snapshot.lab().revision(), services);
+                API_VERSION,
+                snapshot.lab().id(),
+                snapshot.lab().revision(),
+                observedAt,
+                services,
+                topology(snapshot),
+                storage(snapshot),
+                cleanupPlan(snapshot));
     }
 
     public TestHistoryResponse testHistory(String id, int limit) {
@@ -238,9 +259,19 @@ public class LabApiService {
                 tests.findRecentByLab(lab.id(), limit).stream().map(LabApiService::testRun).toList());
     }
 
-    public LogListResponse logs(String id) {
+    public LogListResponse logs(String id, String service, int tail) {
         LabRecord lab = findLab(id);
-        return new LogListResponse(API_VERSION, lab.id(), "PLANNED", List.of(), false);
+        DockerLogBatch batch = lifecycle.readLogs(lab.id(), service, tail);
+        return new LogListResponse(
+                API_VERSION,
+                lab.id(),
+                service,
+                "AVAILABLE",
+                batch.lines().stream()
+                        .map(line -> new LogLineResponse(
+                                line.timestamp(), line.service(), line.stream(), line.text()))
+                        .toList(),
+                batch.truncated());
     }
 
     public TemplateListResponse templates() {
@@ -255,7 +286,7 @@ public class LabApiService {
                 false,
                 false,
                 "PLANNED",
-                "PLANNED",
+                "AVAILABLE",
                 "PLANNED");
     }
 
@@ -358,11 +389,17 @@ public class LabApiService {
     private static ServiceStatusResponse service(DockerContainerView container, String image) {
         return new ServiceStatusResponse(
                 container.service(),
+                container.service(),
                 image,
                 container.status(),
                 container.running(),
                 container.exitCode().isPresent() ? container.exitCode().getAsInt() : null,
                 container.health().name(),
+                null,
+                null,
+                new ServiceMetricsResponse("UNAVAILABLE", null, null, null, null, null),
+                null,
+                null,
                 container.ports().stream()
                         .map(port -> new PortMappingResponse(
                                 port.containerPort(),
@@ -371,6 +408,163 @@ public class LabApiService {
                                 port.protocol(),
                                 "127.0.0.1:" + port.hostPort()))
                         .toList());
+    }
+
+    private static ServiceStatusResponse service(
+            DockerServiceObservation observation, Instant observedAt) {
+        var container = observation.container();
+        var metrics = observation.metrics();
+        Instant startedAt = metrics.startedAt().orElse(null);
+        Long uptime = startedAt == null || startedAt.isAfter(observedAt)
+                ? null : Duration.between(startedAt, observedAt).toSeconds();
+        boolean anyMetric = metrics.cpuPercent().isPresent()
+                || metrics.memoryUsageBytes().isPresent()
+                || metrics.memoryLimitBytes().isPresent();
+        String availability = container.running()
+                ? (anyMetric ? "AVAILABLE" : "UNAVAILABLE")
+                : "NOT_RUNNING";
+        return new ServiceStatusResponse(
+                container.service(),
+                container.service(),
+                observation.imageReference().orElse("unavailable"),
+                container.status(),
+                container.running(),
+                container.exitCode().isPresent() ? container.exitCode().getAsInt() : null,
+                container.health().name(),
+                startedAt,
+                uptime,
+                new ServiceMetricsResponse(
+                        availability,
+                        metrics.cpuPercent().isPresent() ? metrics.cpuPercent().orElseThrow() : null,
+                        metrics.memoryUsageBytes().isPresent()
+                                ? metrics.memoryUsageBytes().orElseThrow() : null,
+                        metrics.memoryLimitBytes().isPresent()
+                                ? metrics.memoryLimitBytes().orElseThrow() : null,
+                        metrics.networkReadBytes().isPresent()
+                                ? metrics.networkReadBytes().orElseThrow() : null,
+                        metrics.networkWriteBytes().isPresent()
+                                ? metrics.networkWriteBytes().orElseThrow() : null),
+                observation.imageSizeBytes().isPresent()
+                        ? observation.imageSizeBytes().orElseThrow() : null,
+                observation.writableLayerBytes().isPresent()
+                        ? observation.writableLayerBytes().orElseThrow() : null,
+                container.ports().stream()
+                        .map(port -> new PortMappingResponse(
+                                port.containerPort(),
+                                port.hostAddress(),
+                                port.hostPort(),
+                                port.protocol(),
+                                "127.0.0.1:" + port.hostPort()))
+                        .toList());
+    }
+
+    private static TopologyResponse topology(DockerObservabilitySnapshot snapshot) {
+        List<TopologyNodeResponse> nodes = new java.util.ArrayList<>();
+        List<TopologyEdgeResponse> edges = new java.util.ArrayList<>();
+        nodes.add(new TopologyNodeResponse("local-host", "LOCAL_HOST", "This computer", "LOCAL"));
+        if (snapshot.networkPresent()) {
+            nodes.add(new TopologyNodeResponse(
+                    "lab-network", "LAB_NETWORK", "Lab network", "ACTIVE"));
+        }
+        for (DockerServiceObservation service : snapshot.services()) {
+            String serviceId = "service:" + service.container().service();
+            nodes.add(new TopologyNodeResponse(
+                    serviceId,
+                    "SERVICE",
+                    service.container().service(),
+                    service.container().status().toUpperCase(java.util.Locale.ROOT)));
+            if (snapshot.networkPresent()) {
+                edges.add(new TopologyEdgeResponse(
+                        serviceId + ":network",
+                        "ATTACHED_TO_NETWORK",
+                        serviceId,
+                        "lab-network",
+                        null,
+                        null));
+            }
+            for (var port : service.container().ports()) {
+                edges.add(new TopologyEdgeResponse(
+                        serviceId + ":port:" + port.containerPort(),
+                        "PUBLISHES_PORT",
+                        serviceId,
+                        "local-host",
+                        port.containerPort(),
+                        "127.0.0.1:" + port.hostPort()));
+            }
+            for (int mountIndex = 0; mountIndex < service.volumeMounts().size(); mountIndex++) {
+                var mount = service.volumeMounts().get(mountIndex);
+                edges.add(new TopologyEdgeResponse(
+                        serviceId + ":volume:" + mount.volume() + ":" + mountIndex,
+                        "MOUNTS_VOLUME",
+                        serviceId,
+                        "volume:" + mount.volume(),
+                        null,
+                        mount.target()));
+            }
+        }
+        snapshot.volumes().forEach(volume -> nodes.add(new TopologyNodeResponse(
+                "volume:" + volume.volume(), "VOLUME", volume.volume(), "RETAINED")));
+        return new TopologyResponse(nodes, edges);
+    }
+
+    private static StorageResponse storage(DockerObservabilitySnapshot snapshot) {
+        List<ImageUseResponse> images = snapshot.services().stream()
+                .map(service -> new ImageUseResponse(
+                        service.container().service(),
+                        service.imageReference().orElse("unavailable"),
+                        service.imageSizeBytes().isPresent()
+                                ? service.imageSizeBytes().orElseThrow() : null,
+                        true,
+                        false))
+                .toList();
+        List<VolumeUseResponse> volumes = snapshot.volumes().stream()
+                .map(volume -> new VolumeUseResponse(
+                        volume.volume(),
+                        volume.sizeBytes().isPresent() ? volume.sizeBytes().orElseThrow() : null,
+                        volume.measurement(),
+                        "KEEP"))
+                .toList();
+        long knownWritableBytes = 0;
+        boolean complete = true;
+        for (DockerServiceObservation service : snapshot.services()) {
+            if (service.writableLayerBytes().isEmpty()) {
+                complete = false;
+                continue;
+            }
+            try {
+                knownWritableBytes = Math.addExact(
+                        knownWritableBytes, service.writableLayerBytes().orElseThrow());
+            } catch (ArithmeticException overflow) {
+                knownWritableBytes = 0;
+                complete = false;
+                break;
+            }
+        }
+        return new StorageResponse(
+                images,
+                volumes,
+                knownWritableBytes,
+                complete,
+                volumes.stream().anyMatch(volume -> volume.sizeBytes() == null));
+    }
+
+    private static CleanupPlanResponse cleanupPlan(DockerObservabilitySnapshot snapshot) {
+        List<CleanupActionResponse> actions = new java.util.ArrayList<>();
+        snapshot.services().forEach(service -> actions.add(new CleanupActionResponse(
+                "CONTAINER", service.container().service(), "REMOVE_ON_STOP")));
+        if (snapshot.networkPresent()) {
+            actions.add(new CleanupActionResponse("NETWORK", "lab-network", "REMOVE_ON_STOP"));
+        }
+        snapshot.volumes().forEach(volume -> actions.add(new CleanupActionResponse(
+                "VOLUME", volume.volume(), "KEEP")));
+        snapshot.services().forEach(service -> actions.add(new CleanupActionResponse(
+                "IMAGE", service.imageReference().orElse("unavailable"), "KEEP")));
+        StorageResponse storage = storage(snapshot);
+        return new CleanupPlanResponse(
+                true,
+                storage.knownWritableBytes(),
+                storage.writableEstimateComplete(),
+                actions);
     }
 
     private static TestRunResponse testRun(TestRunRecord run) {

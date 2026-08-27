@@ -12,6 +12,7 @@ public record LabOwnership(String labId, String projectId) {
     public static final String TYPE_LABEL = "io.labdeck.resource-type";
     public static final String LOGICAL_NAME_LABEL = "io.labdeck.logical-name";
     public static final String TOKEN_LABEL = "io.labdeck.ownership-token";
+    public static final String IMAGE_REFERENCE_LABEL = "io.labdeck.image-reference";
 
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,63}");
 

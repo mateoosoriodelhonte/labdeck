@@ -2,6 +2,9 @@ package io.labdeck.docker;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import io.labdeck.lab.LabFailureCode;
 import io.labdeck.lab.LabRecord;
@@ -46,6 +49,38 @@ class DockerLabLifecycleTests {
 
     @TempDir
     Path temporaryDirectory;
+
+    @Test
+    void emptyObservationStillRejectsAChangedLabRevision() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("empty-observation-workspace"));
+        LabRecord observed = lab(workspace);
+        LabRecord changed = new LabRecord(
+                observed.id(),
+                observed.projectId(),
+                observed.name(),
+                observed.manifestVersion(),
+                observed.workspace(),
+                LabState.STARTING,
+                1,
+                observed.createdAt(),
+                NOW.plusSeconds(1));
+        LabRepository labs = mock(LabRepository.class);
+        DockerResourceJournal journal = mock(DockerResourceJournal.class);
+        DockerEnginePort engine = mock(DockerEnginePort.class);
+        AtomicInteger reads = new AtomicInteger();
+        when(labs.findById(observed.id()))
+                .thenAnswer(ignored -> Optional.of(reads.getAndIncrement() == 0 ? observed : changed));
+        when(journal.findOpenByLab(any(LabOwnership.class))).thenReturn(List.of());
+        DockerLabLifecycle lifecycle = new DockerLabLifecycle(engine, journal, labs);
+
+        try {
+            assertThatThrownBy(() -> lifecycle.inspectObservabilitySnapshot(observed.id()))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("The lab changed during Docker observation. Refresh and retry.");
+        } finally {
+            lifecycle.close();
+        }
+    }
 
     @Test
     void startsByImmutableImageIdAndStopsOnlyJournaledResources() throws Exception {
@@ -126,6 +161,96 @@ class DockerLabLifecycleTests {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("does not exist");
         assertThat(engine.calls).hasSize(callsBeforeMissingLab);
+    }
+
+    @Test
+    void aBlockedObservationDoesNotBlockStopAndCannotReturnAStaleSnapshot() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("observation-stop-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+        engine.blockNextObservation();
+
+        try (ExecutorService execution = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<DockerObservabilitySnapshot> observation = execution.submit(
+                    () -> lifecycle.inspectObservabilitySnapshot(lab.id()));
+            assertThat(engine.awaitObservation()).isTrue();
+            Future<LabRecord> stop = execution.submit(() -> lifecycle.stop(lab.id()));
+
+            LabRecord stopped;
+            try {
+                stopped = stop.get(500, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException failure) {
+                throw new AssertionError("Stop remained blocked behind Docker observation.", failure);
+            } finally {
+                engine.releaseObservation();
+            }
+            assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+            assertThatThrownBy(() -> observation.get(1, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(IllegalStateException.class)
+                    .hasRootCauseMessage("The lab changed during Docker observation. Refresh and retry.");
+        } finally {
+            engine.releaseObservation();
+            lifecycle.close();
+        }
+    }
+
+    @Test
+    void stopCancelsActiveLogSubscriptions() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("log-stop-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+
+        DockerLogSubscription subscription = lifecycle.followLogs(
+                lab.id(), "app", 20, ignored -> {});
+        assertThat(subscription.closed()).isFalse();
+
+        LabRecord stopped = lifecycle.stop(lab.id());
+
+        assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+        assertThat(subscription.closed()).isTrue();
+        lifecycle.close();
+    }
+
+    @Test
+    void observationHasAFiveSecondAggregateDeadline() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("observation-timeout-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        lifecycle.start(lab, plan(), CancellationToken.NONE);
+        engine.blockObservationUntilInterrupted();
+
+        try (ExecutorService execution = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<DockerObservabilitySnapshot> observation = execution.submit(
+                    () -> lifecycle.inspectObservabilitySnapshot(lab.id()));
+            assertThat(engine.awaitObservation()).isTrue();
+
+            try {
+                assertThatThrownBy(() -> observation.get(6, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class)
+                        .hasRootCauseMessage("Docker observation exceeded its safe time limit.");
+            } finally {
+                observation.cancel(true);
+                engine.releaseObservation();
+            }
+        } finally {
+            engine.releaseObservation();
+            lifecycle.close();
+        }
     }
 
     @Test
@@ -481,10 +606,14 @@ class DockerLabLifecycleTests {
                 DockerServiceReadinessException.exited("app", java.util.OptionalInt.of(0))));
         assertThat(labs.findById(lab.id()).orElseThrow()).isEqualTo(second.lab());
         assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.RUNNING);
+        DockerLogSubscription subscription = lifecycle.followLogs(
+                lab.id(), "app", 20, ignored -> {});
+        assertThat(subscription.closed()).isFalse();
 
         monitor.failureHandler.accept(DockerRuntimeMonitorPort.RuntimeFailure.serviceFailed(
                 DockerServiceReadinessException.exited("app", java.util.OptionalInt.of(0))));
         assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.FAILED);
+        assertThat(subscription.closed()).isTrue();
         LabRuntimeFailure runtimeFailure = labs.findRuntimeFailure(lab.id()).orElseThrow();
         assertThat(runtimeFailure.code()).isEqualTo(LabFailureCode.CONTAINER_EXITED);
         assertThat(runtimeFailure.service()).contains("app");
@@ -831,11 +960,32 @@ class DockerLabLifecycleTests {
         private DockerHealthStatus healthStatus = DockerHealthStatus.HEALTHY;
         private boolean containersRunning = true;
         private boolean failVolumeVerification;
+        private final AtomicBoolean blockObservation = new AtomicBoolean();
+        private final AtomicBoolean interruptOnlyObservation = new AtomicBoolean();
+        private final CountDownLatch observationEntered = new CountDownLatch(1);
+        private final CountDownLatch observationReleased = new CountDownLatch(1);
 
         void addImage(String reference, String id) {
             DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of(), false);
             images.put(reference, metadata);
             images.put(id, metadata);
+        }
+
+        void blockNextObservation() {
+            blockObservation.set(true);
+        }
+
+        void blockObservationUntilInterrupted() {
+            interruptOnlyObservation.set(true);
+            blockObservation.set(true);
+        }
+
+        boolean awaitObservation() throws InterruptedException {
+            return observationEntered.await(2, TimeUnit.SECONDS);
+        }
+
+        void releaseObservation() {
+            observationReleased.countDown();
         }
 
         @Override
@@ -947,6 +1097,63 @@ class DockerLabLifecycleTests {
         }
 
         @Override
+        public DockerServiceObservation inspectContainerObservation(
+                DockerResourceRecord active, Map<String, String> ownedVolumes) {
+            DockerContainerView container = inspectContainerSnapshot(active);
+            DockerContainerSpec specification = createdSpecifications.get(active.engineId().orElseThrow());
+            if (blockObservation.compareAndSet(true, false)) {
+                observationEntered.countDown();
+                try {
+                    if (interruptOnlyObservation.get()) {
+                        observationReleased.await();
+                    } else if (!observationReleased.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("The observation test was not released.");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("The observation test was interrupted.", exception);
+                }
+            }
+            return new DockerServiceObservation(
+                    container,
+                    Optional.of(specification.imageReference()),
+                    DockerContainerMetrics.UNAVAILABLE,
+                    java.util.OptionalLong.of(123),
+                    java.util.OptionalLong.of(0),
+                    specification.namedMounts().stream()
+                            .map(mount -> new DockerVolumeMountObservation(
+                                    java.util.Objects.requireNonNull(ownedVolumes.get(mount.volumeId())),
+                                    mount.target(),
+                                    mount.readOnly()))
+                            .toList());
+        }
+
+        @Override
+        public DockerVolumeObservation inspectVolumeObservation(DockerResourceRecord active) {
+            verifyVolume(active);
+            return new DockerVolumeObservation(
+                    active.logicalName(), java.util.OptionalLong.empty(), "UNAVAILABLE");
+        }
+
+        @Override
+        public void verifyNetwork(DockerResourceRecord active) {
+            requireOwned(active.engineId().orElseThrow(), active);
+        }
+
+        @Override
+        public DockerLogBatch readContainerLogs(DockerResourceRecord active, int tail) {
+            requireOwned(active.engineId().orElseThrow(), active);
+            return new DockerLogBatch(List.of(), false);
+        }
+
+        @Override
+        public DockerLogSubscription followContainerLogs(
+                DockerResourceRecord active, int tail, Consumer<DockerLogLine> consumer) {
+            requireOwned(active.engineId().orElseThrow(), active);
+            return new TestLogSubscription();
+        }
+
+        @Override
         public void startContainer(
                 DockerResourceRecord active, DockerContainerSpec specification) {
             requireOwned(active.engineId().orElseThrow(), active);
@@ -994,6 +1201,52 @@ class DockerLabLifecycleTests {
             DockerResourceRecord reserved = resources.get(id);
             if (reserved == null || !reserved.ownershipToken().equals(active.ownershipToken())) {
                 throw new DockerOwnershipException("not owned");
+            }
+        }
+    }
+
+    private static final class TestLogSubscription implements DockerLogSubscription {
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private final java.util.concurrent.CopyOnWriteArrayList<Runnable> closeListeners =
+                new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        public boolean await(Duration timeout) {
+            return closed.get();
+        }
+
+        @Override
+        public boolean truncated() {
+            return false;
+        }
+
+        @Override
+        public boolean failed() {
+            return false;
+        }
+
+        @Override
+        public boolean closed() {
+            return closed.get();
+        }
+
+        @Override
+        public void onClose(Runnable listener) {
+            if (closed.get()) {
+                listener.run();
+                return;
+            }
+            closeListeners.add(listener);
+            if (closed.get() && closeListeners.remove(listener)) {
+                listener.run();
+            }
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                closeListeners.forEach(Runnable::run);
+                closeListeners.clear();
             }
         }
     }

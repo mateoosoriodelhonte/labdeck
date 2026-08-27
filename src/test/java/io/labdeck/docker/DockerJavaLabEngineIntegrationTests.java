@@ -149,6 +149,10 @@ class DockerJavaLabEngineIntegrationTests {
             assertThat(lifecycle.inspectServices(labId))
                     .usingRecursiveComparison()
                     .isEqualTo(started.containers());
+            DockerObservabilitySnapshot observation = lifecycle.inspectObservabilitySnapshot(labId);
+            assertThat(observation.services()).singleElement().satisfies(service ->
+                    assertThat(service.volumeMounts()).containsExactly(
+                            new DockerVolumeMountObservation("course-data", "/data", false)));
 
             LabRecord stopped = lifecycle.stop(labId);
 
@@ -209,6 +213,59 @@ class DockerJavaLabEngineIntegrationTests {
             }
             docker.close();
             deleteGeneratedDirectory(runDirectory);
+        }
+    }
+
+    @Test
+    void reportsBoundedLogsMetricsAndOwnedStorageFromARealContainer() throws Exception {
+        String name = "Docker observability integration lab";
+        try (DockerScenario scenario = new DockerScenario(name)) {
+            ManifestPlan observable = compile("""
+                    version: 1
+                    name: Docker observability integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["ping", "-i", "1", "127.0.0.1"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    """);
+
+            DockerStartResult started = scenario.lifecycle.start(
+                    scenario.lab, observable, CancellationToken.NONE);
+            String containerId = started.containers().getFirst().id();
+            HostConfig hostConfig = scenario.docker.inspectContainerCmd(containerId)
+                    .exec().getHostConfig();
+            assertThat(hostConfig.getLogConfig().getType().toString()).isEqualTo("local");
+            assertThat(hostConfig.getLogConfig().getConfig()).containsAllEntriesOf(Map.of(
+                    "max-size", "10m",
+                    "max-file", "3",
+                    "compress", "true"));
+
+            DockerLogBatch logs = awaitLogs(scenario.lifecycle, scenario.labId, "app");
+            assertThat(logs.lines()).isNotEmpty().allSatisfy(line -> {
+                assertThat(line.service()).isEqualTo("app");
+                assertThat(line.text()).doesNotContain("\u001b");
+                assertThat(line.timestamp()).isAfter(Instant.EPOCH);
+            });
+            assertThat(logs.lines()).anySatisfy(line ->
+                    assertThat(line.text()).contains("127.0.0.1"));
+
+            DockerObservabilitySnapshot observation =
+                    scenario.lifecycle.inspectObservabilitySnapshot(scenario.labId);
+            assertThat(observation.services()).singleElement().satisfies(service -> {
+                assertThat(service.imageReference()).contains(IMAGE);
+                assertThat(service.imageSizeBytes()).isPresent();
+                assertThat(service.imageSizeBytes().orElseThrow()).isPositive();
+                assertThat(service.writableLayerBytes()).isPresent();
+                assertThat(service.writableLayerBytes().orElseThrow()).isNotNegative();
+                assertThat(service.metrics().startedAt()).isPresent();
+                assertThat(service.metrics().memoryUsageBytes()).isPresent();
+                assertThat(service.metrics().memoryLimitBytes()).hasValue(64L * 1024 * 1024);
+            });
         }
     }
 
@@ -368,6 +425,20 @@ class DockerJavaLabEngineIntegrationTests {
 
     private static ManifestPlan compile(String yaml) {
         return new ManifestPlanCompiler().compile(new RestrictedManifestParser().parse(yaml));
+    }
+
+    private static DockerLogBatch awaitLogs(
+            DockerLabLifecycle lifecycle, String labId, String service) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        DockerLogBatch latest = new DockerLogBatch(List.of(), false);
+        while (System.nanoTime() < deadline) {
+            latest = lifecycle.readLogs(labId, service, 20);
+            if (!latest.lines().isEmpty()) {
+                return latest;
+            }
+            Thread.sleep(100);
+        }
+        return latest;
     }
 
     private static ManifestPlan plan() {
