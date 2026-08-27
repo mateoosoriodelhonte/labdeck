@@ -1,5 +1,8 @@
 package io.labdeck.docker;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -14,6 +17,8 @@ import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.RestartPolicy;
 import com.github.dockerjava.api.command.PullImageResultCallback;
+import com.github.dockerjava.core.DockerClientImpl;
+import com.github.dockerjava.transport.DockerHttpClient;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -23,16 +28,33 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Pattern;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 @Component
 public class DockerJavaLabEngine implements DockerEnginePort {
 
-    private final DockerClient docker;
+    private static final Pattern VOLUME_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]{0,254}");
+    private static final ObjectMapper JSON = new ObjectMapper();
 
+    private final DockerClient docker;
+    private final DockerHttpClient http;
+
+    @Autowired
     public DockerJavaLabEngine(DockerClient docker) {
+        this(docker, requireHttpClient(docker));
+    }
+
+    DockerJavaLabEngine(DockerClient docker, DockerHttpClient http) {
         this.docker = Objects.requireNonNull(docker, "docker");
+        this.http = Objects.requireNonNull(http, "http");
     }
 
     @Override
@@ -62,10 +84,15 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         requireTimeout(timeout, Duration.ofSeconds(1), Duration.ofMinutes(30));
         cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
         long deadline = System.nanoTime() + timeout.toNanos();
-        try (PullImageResultCallback callback = new PullImageResultCallback()) {
+        try (ExecutorService waiter = Executors.newVirtualThreadPerTaskExecutor();
+                PullImageResultCallback callback = new PullImageResultCallback()) {
             docker.pullImageCmd(reference)
                     .withAuthConfig(new AuthConfig())
                     .exec(callback);
+            Future<?> completion = waiter.submit(() -> {
+                callback.awaitCompletion();
+                return null;
+            });
             while (true) {
                 cancellation.throwIfCancellationRequested();
                 long remaining = deadline - System.nanoTime();
@@ -73,8 +100,13 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                     throw new IllegalStateException("The confirmed public image pull timed out.");
                 }
                 long waitNanos = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(100));
-                if (callback.awaitCompletion(waitNanos, TimeUnit.NANOSECONDS)) {
+                try {
+                    completion.get(waitNanos, TimeUnit.NANOSECONDS);
                     return;
+                } catch (TimeoutException expectedWhilePulling) {
+                    // Recheck timeout and cancellation without closing the active callback.
+                } catch (ExecutionException failure) {
+                    throw propagatePullFailure(failure.getCause());
                 }
             }
         } catch (InterruptedException exception) {
@@ -86,27 +118,29 @@ public class DockerJavaLabEngine implements DockerEnginePort {
     }
 
     @Override
-    public Optional<String> reconcileReserved(DockerResourceRecord reserved) {
-        requireReserved(reserved);
-        List<String> matches = switch (reserved.type()) {
+    public Optional<DockerCreatedResource> reconcileDispatched(DockerResourceRecord dispatched) {
+        requireDispatched(dispatched);
+        List<DockerCreatedResource> matches = switch (dispatched.type()) {
             case CONTAINER -> docker.listContainersCmd()
                     .withShowAll(true)
-                    .withLabelFilter(reserved.labels())
+                    .withLabelFilter(dispatched.labels())
                     .exec().stream()
                     .map(com.github.dockerjava.api.model.Container::getId)
                     .filter(Objects::nonNull)
-                    .filter(id -> hasExactContainerLabels(id, reserved))
+                    .filter(id -> hasExactContainerIdentity(id, dispatched))
+                    .map(DockerCreatedResource::withImmutableId)
                     .toList();
             case NETWORK -> docker.listNetworksCmd()
-                    .withFilter("label", labelFilters(reserved.labels()))
+                    .withFilter("label", labelFilters(dispatched.labels()))
                     .exec().stream()
                     .map(com.github.dockerjava.api.model.Network::getId)
                     .filter(Objects::nonNull)
-                    .filter(id -> hasExactNetworkLabels(id, reserved))
+                    .filter(id -> hasExactNetworkIdentity(id, dispatched))
+                    .map(DockerCreatedResource::withImmutableId)
                     .toList();
             case VOLUME -> {
                 var response = docker.listVolumesCmd()
-                        .withFilter("label", labelFilters(reserved.labels()))
+                        .withFilter("label", labelFilters(dispatched.labels()))
                         .exec();
                 var volumes = response == null || response.getVolumes() == null
                         ? List.<com.github.dockerjava.api.command.InspectVolumeResponse>of()
@@ -114,66 +148,82 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 yield volumes.stream()
                         .map(com.github.dockerjava.api.command.InspectVolumeResponse::getName)
                         .filter(Objects::nonNull)
-                        .filter(id -> hasExactVolumeLabels(id, reserved))
+                        .filter(id -> engineName(dispatched).equals(id))
+                        .filter(id -> hasExactVolumeLabels(id, dispatched))
+                        .map(id -> DockerCreatedResource.identified(id, inspectVolumeIdentity(id)))
                         .toList();
             }
         };
         if (matches.size() > 1) {
-            throw new DockerOwnershipException("More than one Docker resource matched a reserved ownership token.");
+            throw new DockerOwnershipException(
+                    "More than one Docker resource matched a dispatched ownership token.");
         }
         return matches.stream().findFirst();
     }
 
     @Override
-    public String createNetwork(DockerResourceRecord reserved) {
-        requireType(reserved, DockerResourceType.NETWORK, DockerResourceState.RESERVED);
-        requireExpectedNameAvailable(reserved);
+    public DockerCreatedResource createNetwork(DockerResourceRecord dispatched) {
+        requireType(dispatched, DockerResourceType.NETWORK, DockerResourceState.DISPATCHED);
+        try {
+            requireExpectedNameAvailable(dispatched);
+        } catch (RuntimeException preflightFailure) {
+            throw createWithoutOwnedResource(preflightFailure);
+        }
         String id = docker.createNetworkCmd()
-                .withName(engineName(reserved))
+                .withName(engineName(dispatched))
                 .withDriver("bridge")
                 .withInternal(true)
                 .withAttachable(false)
                 .withCheckDuplicate(false)
-                .withLabels(reserved.labels())
+                .withLabels(dispatched.labels())
                 .exec()
                 .getId();
         requireCreatedId(id);
         var created = docker.inspectNetworkCmd().withNetworkId(id).exec();
-        if (!reserved.hasExactLabels(created.getLabels())
+        if (!dispatched.hasExactLabels(created.getLabels())
                 || !"bridge".equals(created.getDriver())
                 || !Boolean.TRUE.equals(created.getInternal())
                 || Boolean.TRUE.equals(created.isAttachable())) {
             throw new DockerOwnershipException("Docker did not create the planned private bridge network.");
         }
-        return id;
+        return DockerCreatedResource.withImmutableId(id);
     }
 
     @Override
-    public String createVolume(DockerResourceRecord reserved) {
-        requireType(reserved, DockerResourceType.VOLUME, DockerResourceState.RESERVED);
-        requireExpectedNameAvailable(reserved);
+    public DockerCreatedResource createVolume(DockerResourceRecord dispatched) {
+        requireType(dispatched, DockerResourceType.VOLUME, DockerResourceState.DISPATCHED);
+        try {
+            requireExpectedNameAvailable(dispatched);
+        } catch (RuntimeException preflightFailure) {
+            throw createWithoutOwnedResource(preflightFailure);
+        }
         String id = docker.createVolumeCmd()
-                .withName(engineName(reserved))
+                .withName(engineName(dispatched))
                 .withDriver("local")
-                .withLabels(reserved.labels())
+                .withLabels(dispatched.labels())
                 .exec()
                 .getName();
         requireCreatedId(id);
         var created = docker.inspectVolumeCmd(id).exec();
-        if (!reserved.hasExactLabels(created.getLabels()) || !"local".equals(created.getDriver())) {
-            throw new DockerOwnershipException(
-                    "Docker did not create the planned local named volume.");
+        if (!dispatched.hasExactLabels(created.getLabels()) || !"local".equals(created.getDriver())) {
+            throw createWithoutOwnedResource(new DockerOwnershipException(
+                    "Docker did not create the planned local named volume."));
         }
-        return id;
+        return DockerCreatedResource.identified(id, inspectVolumeIdentity(id));
     }
 
     @Override
-    public String createContainer(DockerResourceRecord reserved, DockerContainerSpec specification) {
-        requireType(reserved, DockerResourceType.CONTAINER, DockerResourceState.RESERVED);
+    public DockerCreatedResource createContainer(
+            DockerResourceRecord dispatched, DockerContainerSpec specification) {
+        requireType(dispatched, DockerResourceType.CONTAINER, DockerResourceState.DISPATCHED);
         Objects.requireNonNull(specification, "specification");
-        requireExpectedNameAvailable(reserved);
-        requireImageVolumesCovered(specification);
-        specification.workspace().verifyUnchanged();
+        try {
+            requireExpectedNameAvailable(dispatched);
+            requireImageVolumesCovered(specification);
+            specification.workspace().verifyUnchanged();
+        } catch (RuntimeException preflightFailure) {
+            throw createWithoutOwnedResource(preflightFailure);
+        }
 
         List<Mount> mounts = new ArrayList<>();
         mounts.add(new Mount()
@@ -181,7 +231,7 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withSource(specification.workspace().path().toString())
                 .withTarget(specification.workspaceTarget())
                 .withReadOnly(false)
-                .withBindOptions(new BindOptions().withPropagation(BindPropagation.R_PRIVATE)));
+                .withBindOptions(nonRecursiveWorkspaceBindOptions()));
         specification.namedMounts().forEach(volume -> mounts.add(new Mount()
                 .withType(MountType.VOLUME)
                 .withSource(volume.volumeId())
@@ -197,9 +247,9 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 .withRestartPolicy(RestartPolicy.noRestart());
         CreateContainerCmd command = docker.createContainerCmd(specification.image())
                 .withAuthConfig(new AuthConfig())
-                .withName(engineName(reserved))
-                .withLabels(reserved.labels())
-                .withAliases(reserved.logicalName())
+                .withName(engineName(dispatched))
+                .withLabels(dispatched.labels())
+                .withAliases(dispatched.logicalName())
                 .withWorkingDir(specification.workingDirectory())
                 .withEnv(environment(specification.environment()))
                 .withHostConfig(hostConfig);
@@ -208,9 +258,10 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         }
         String id = command.exec().getId();
         requireCreatedId(id);
-        InspectContainerResponse created = inspectOwnedContainer(reserved.activate(id, reserved.updatedAt()));
+        DockerCreatedResource result = DockerCreatedResource.withImmutableId(id);
+        InspectContainerResponse created = inspectOwnedContainer(dispatched.activate(result, dispatched.updatedAt()));
         requireContainerShape(created, specification);
-        return id;
+        return result;
     }
 
     @Override
@@ -306,6 +357,11 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         var volume = inspectOwnedVolume(active);
         if (!"local".equals(volume.getDriver())) {
             throw new DockerOwnershipException("The journaled Docker volume does not use the local driver.");
+        }
+        if (!active.engineIdentity().orElseThrow()
+                .equals(inspectVolumeIdentity(active.engineId().orElseThrow()))) {
+            throw new DockerOwnershipException(
+                    "The Docker volume name now refers to a replacement volume.");
         }
     }
 
@@ -421,6 +477,18 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         }
     }
 
+    private boolean hasExactContainerIdentity(String id, DockerResourceRecord expected) {
+        try {
+            InspectContainerResponse actual = docker.inspectContainerCmd(id).exec();
+            String actualName = actual.getName() == null ? "" : actual.getName().replaceFirst("^/", "");
+            return engineName(expected).equals(actualName)
+                    && expected.hasExactLabels(
+                            actual.getConfig() == null ? null : actual.getConfig().getLabels());
+        } catch (NotFoundException exception) {
+            return false;
+        }
+    }
+
     private boolean containerIsAbsent(String id) {
         try {
             docker.inspectContainerCmd(id).exec();
@@ -447,6 +515,16 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         }
     }
 
+    private boolean hasExactNetworkIdentity(String id, DockerResourceRecord expected) {
+        try {
+            var actual = docker.inspectNetworkCmd().withNetworkId(id).exec();
+            return engineName(expected).equals(actual.getName())
+                    && expected.hasExactLabels(actual.getLabels());
+        } catch (NotFoundException exception) {
+            return false;
+        }
+    }
+
     private boolean hasExactVolumeLabels(String id, DockerResourceRecord expected) {
         try {
             return expected.hasExactLabels(docker.inspectVolumeCmd(id).exec().getLabels());
@@ -455,10 +533,10 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         }
     }
 
-    private static void requireReserved(DockerResourceRecord resource) {
-        if (resource == null || resource.state() != DockerResourceState.RESERVED
+    private static void requireDispatched(DockerResourceRecord resource) {
+        if (resource == null || resource.state() != DockerResourceState.DISPATCHED
                 || resource.engineId().isPresent()) {
-            throw new IllegalArgumentException("A reserved Docker resource record is required.");
+            throw new IllegalArgumentException("A dispatched Docker resource record is required.");
         }
     }
 
@@ -516,6 +594,66 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         }
     }
 
+    private String inspectVolumeIdentity(String name) {
+        if (name == null || !VOLUME_NAME.matcher(name).matches()) {
+            throw new DockerOwnershipException("The Docker volume name is not safe to inspect.");
+        }
+        var request = DockerHttpClient.Request.builder()
+                .method(DockerHttpClient.Request.Method.GET)
+                .path("/v1.44/volumes/" + name)
+                .build();
+        try (DockerHttpClient.Response response = http.execute(request)) {
+            if (response.getStatusCode() != 200) {
+                throw new DockerOwnershipException(
+                        "The Docker volume identity could not be inspected.");
+            }
+            JsonNode document = JSON.readTree(response.getBody());
+            JsonNode createdAt = document == null ? null : document.get("CreatedAt");
+            String identity = createdAt == null || !createdAt.isTextual() ? null : createdAt.textValue();
+            if (identity == null || identity.isBlank() || identity.length() > 255
+                    || !identity.equals(identity.strip())
+                    || identity.codePoints().anyMatch(Character::isISOControl)) {
+                throw new DockerOwnershipException(
+                        "Docker did not return a stable volume creation identity.");
+            }
+            return identity;
+        } catch (DockerOwnershipException exception) {
+            throw exception;
+        } catch (IOException | RuntimeException exception) {
+            throw new DockerOwnershipException(
+                    "The Docker volume identity could not be inspected safely.", exception);
+        }
+    }
+
+    private static DockerHttpClient requireHttpClient(DockerClient docker) {
+        if (docker instanceof DockerClientImpl client) {
+            return client.getHttpClient();
+        }
+        throw new IllegalArgumentException("A docker-java client with its HTTP transport is required.");
+    }
+
+    private static RuntimeException propagatePullFailure(Throwable cause) {
+        if (cause instanceof RuntimeException runtimeException) {
+            return runtimeException;
+        }
+        if (cause instanceof Error error) {
+            throw error;
+        }
+        return new IllegalStateException("The confirmed public image pull failed.", cause);
+    }
+
+    private static DockerCreateWithoutOwnedResourceException createWithoutOwnedResource(
+            RuntimeException cause) {
+        return new DockerCreateWithoutOwnedResourceException(
+                "Docker did not create a LabDeck-owned resource.", cause);
+    }
+
+    static BindOptions nonRecursiveWorkspaceBindOptions() {
+        NonRecursiveBindOptions options = new NonRecursiveBindOptions();
+        options.withPropagation(BindPropagation.R_PRIVATE);
+        return options;
+    }
+
     private static DockerOwnershipException ownershipMismatch() {
         return new DockerOwnershipException("The Docker resource does not match its ownership journal.");
     }
@@ -525,5 +663,13 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 "The Docker resource ID in the ownership journal is stale.");
         exception.initCause(cause);
         return exception;
+    }
+
+    private static final class NonRecursiveBindOptions extends BindOptions {
+
+        @JsonProperty("NonRecursive")
+        public boolean isNonRecursive() {
+            return true;
+        }
     }
 }

@@ -97,6 +97,12 @@
             <artifactId>docker-java-transport-zerodep</artifactId>
             <version>${docker-java.version}</version>
         </dependency>
+        <dependency>
+            <groupId>org.immutables</groupId>
+            <artifactId>value-annotations</artifactId>
+            <version>2.10.1</version>
+            <scope>provided</scope>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>

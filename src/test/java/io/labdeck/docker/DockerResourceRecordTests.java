@@ -37,7 +37,10 @@ class DockerResourceRecordTests {
                 DockerResourceType.NETWORK, "lab-network", NOW);
 
         assertThat(reserved.toString()).contains("ownershipToken=<redacted>").doesNotContain(TOKEN);
-        assertThat(reserved.activate("engine-id", NOW).state()).isEqualTo(DockerResourceState.ACTIVE);
+        DockerResourceRecord dispatched = reserved.dispatch(NOW);
+        assertThat(dispatched.activate(
+                        DockerCreatedResource.withImmutableId("engine-id"), NOW).state())
+                .isEqualTo(DockerResourceState.ACTIVE);
         assertThatThrownBy(() -> DockerResourceRecord.reserved(
                         "short", reserved.ownership(), DockerResourceType.NETWORK, "lab-network", NOW))
                 .isInstanceOf(IllegalArgumentException.class);

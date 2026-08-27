@@ -1,6 +1,7 @@
 package io.labdeck.docker;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
@@ -129,6 +130,23 @@ class DockerJavaLabEngineIntegrationTests {
                             LabOwnership.PROJECT_LABEL, projectId))
                     .exec()).extracting(com.github.dockerjava.api.model.Container::getId)
                     .containsExactly(sentinelId);
+
+            Map<String, String> originalVolumeLabels = docker
+                    .inspectVolumeCmd(volume.engineId().orElseThrow()).exec().getLabels();
+            assertThat(originalVolumeLabels).containsAllEntriesOf(volume.labels());
+            docker.removeVolumeCmd(volume.engineId().orElseThrow()).exec();
+            docker.createVolumeCmd()
+                    .withName(volume.engineId().orElseThrow())
+                    .withDriver("local")
+                    .withLabels(originalVolumeLabels)
+                    .exec();
+
+            DockerLabLifecycle activeLifecycle = lifecycle;
+            assertThatThrownBy(() -> activeLifecycle.start(stopped, plan(), CancellationToken.NONE))
+                    .isInstanceOf(DockerOwnershipException.class)
+                    .hasMessageContaining("replacement volume");
+            assertThat(labs.findById(labId).orElseThrow().state()).isEqualTo(LabState.FAILED);
+            assertThat(docker.inspectContainerCmd(sentinelId).exec().getState().getRunning()).isTrue();
         } finally {
             if (lifecycle != null) {
                 try {
@@ -221,7 +239,10 @@ class DockerJavaLabEngineIntegrationTests {
         List<DockerResourceRecord> active = new java.util.ArrayList<>();
         for (DockerResourceRecord resource : resources) {
             if (resource.state() == DockerResourceState.RESERVED) {
-                Optional<String> match = engine.reconcileReserved(resource);
+                continue;
+            }
+            if (resource.state() == DockerResourceState.DISPATCHED) {
+                Optional<DockerCreatedResource> match = engine.reconcileDispatched(resource);
                 if (match.isEmpty()) {
                     continue;
                 }

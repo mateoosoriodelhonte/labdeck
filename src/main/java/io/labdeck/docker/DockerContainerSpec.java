@@ -44,7 +44,7 @@ public record DockerContainerSpec(
     public String toString() {
         return "DockerContainerSpec[image=" + image
                 + ", workingDirectory=" + workingDirectory
-                + ", command=" + command
+                + ", commandItems=" + command.size()
                 + ", environmentKeys=" + new java.util.TreeSet<>(environment.keySet())
                 + ", workspace=" + workspace
                 + ", workspaceTarget=" + workspaceTarget

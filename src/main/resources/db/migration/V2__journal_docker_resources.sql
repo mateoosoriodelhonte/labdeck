@@ -14,12 +14,19 @@ CREATE TABLE docker_resource (
         AND logical_name NOT GLOB '*[^a-z0-9-]*'
     ),
     engine_id TEXT CHECK (engine_id IS NULL OR length(engine_id) BETWEEN 1 AND 255),
-    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('RESERVED', 'ACTIVE', 'REMOVED')),
+    engine_identity TEXT CHECK (
+        engine_identity IS NULL OR length(engine_identity) BETWEEN 1 AND 255
+    ),
+    lifecycle_state TEXT NOT NULL CHECK (
+        lifecycle_state IN ('RESERVED', 'DISPATCHED', 'ACTIVE', 'REMOVED')
+    ),
     created_at_epoch_ms INTEGER NOT NULL CHECK (created_at_epoch_ms >= 0),
     updated_at_epoch_ms INTEGER NOT NULL CHECK (updated_at_epoch_ms >= created_at_epoch_ms),
     CHECK (
-        (lifecycle_state = 'RESERVED' AND engine_id IS NULL)
-        OR (lifecycle_state = 'ACTIVE' AND engine_id IS NOT NULL)
+        (lifecycle_state IN ('RESERVED', 'DISPATCHED')
+            AND engine_id IS NULL AND engine_identity IS NULL)
+        OR (lifecycle_state = 'ACTIVE' AND engine_id IS NOT NULL
+            AND ((resource_type = 'VOLUME') = (engine_identity IS NOT NULL)))
         OR lifecycle_state = 'REMOVED'
     ),
     FOREIGN KEY (lab_id, project_id) REFERENCES lab(id, project_id) ON DELETE RESTRICT
@@ -27,7 +34,7 @@ CREATE TABLE docker_resource (
 
 CREATE UNIQUE INDEX docker_resource_open_logical_idx
     ON docker_resource(lab_id, resource_type, logical_name)
-    WHERE lifecycle_state IN ('RESERVED', 'ACTIVE');
+    WHERE lifecycle_state IN ('RESERVED', 'DISPATCHED', 'ACTIVE');
 
 CREATE UNIQUE INDEX docker_resource_open_engine_idx
     ON docker_resource(resource_type, engine_id)

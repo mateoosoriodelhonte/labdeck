@@ -12,13 +12,14 @@ public interface DockerEnginePort {
     void pullPublicImageAfterConfirmation(
             String reference, Duration timeout, CancellationToken cancellation);
 
-    Optional<String> reconcileReserved(DockerResourceRecord reserved);
+    Optional<DockerCreatedResource> reconcileDispatched(DockerResourceRecord dispatched);
 
-    String createNetwork(DockerResourceRecord reserved);
+    DockerCreatedResource createNetwork(DockerResourceRecord dispatched);
 
-    String createVolume(DockerResourceRecord reserved);
+    DockerCreatedResource createVolume(DockerResourceRecord dispatched);
 
-    String createContainer(DockerResourceRecord reserved, DockerContainerSpec specification);
+    DockerCreatedResource createContainer(
+            DockerResourceRecord dispatched, DockerContainerSpec specification);
 
     DockerContainerView inspectContainer(DockerResourceRecord active);
 

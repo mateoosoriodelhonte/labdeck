@@ -40,16 +40,20 @@ class SQLiteDockerResourceJournalTests {
             journal.reserve(reserved);
             assertThat(journal.findOpen(OWNERSHIP, DockerResourceType.VOLUME, "course-data"))
                     .contains(reserved);
+            assertThat(journal.markDispatched(
+                    reserved.ownershipToken(), CREATED.plusMillis(500))).isTrue();
             assertThat(journal.activate(
-                    reserved.ownershipToken(), "labdeck-volume-id", CREATED.plusSeconds(1))).isTrue();
+                    reserved.ownershipToken(), "labdeck-volume-id", Optional.of("created-at-proof"),
+                    CREATED.plusSeconds(1))).isTrue();
             DockerResourceRecord active = journal.findOpenByLab(OWNERSHIP).getFirst();
             assertThat(active.state()).isEqualTo(DockerResourceState.ACTIVE);
             assertThat(active.engineId()).contains("labdeck-volume-id");
+            assertThat(active.engineIdentity()).contains("created-at-proof");
 
             assertThat(journal.markRemoved(
-                    active.ownershipToken(), Optional.of("wrong-id"), CREATED.plusSeconds(2))).isFalse();
+                    active.ownershipToken(), "wrong-id", CREATED.plusSeconds(2))).isFalse();
             assertThat(journal.markRemoved(
-                    active.ownershipToken(), active.engineId(), CREATED.plusSeconds(2))).isTrue();
+                    active.ownershipToken(), active.engineId().orElseThrow(), CREATED.plusSeconds(2))).isTrue();
             assertThat(journal.findOpenByLab(OWNERSHIP)).isEmpty();
         }
     }

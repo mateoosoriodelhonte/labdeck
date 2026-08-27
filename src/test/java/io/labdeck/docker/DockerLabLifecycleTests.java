@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -105,6 +106,78 @@ class DockerLabLifecycleTests {
         assertThat(engine.inspectImage("busybox:1.37")).isPresent();
     }
 
+    @Test
+    void aPreDispatchReservationNeverAdoptsAnExactLabelSentinel() {
+        LabRecord failedLab = lab(temporaryDirectory, LabState.FAILED);
+        MemoryLabRepository labs = new MemoryLabRepository(failedLab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        DockerResourceRecord reserved = DockerResourceRecord.reserved(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                new LabOwnership(failedLab.id(), failedLab.projectId()),
+                DockerResourceType.CONTAINER,
+                "app",
+                NOW);
+        journal.reserve(reserved);
+        engine.resources.put("foreign-exact-label-sentinel", reserved);
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        LabRecord stopped = lifecycle.stop(failedLab.id());
+
+        assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+        assertThat(engine.resources).containsKey("foreign-exact-label-sentinel");
+        assertThat(journal.findOpenByLab(reserved.ownership())).isEmpty();
+    }
+
+    @Test
+    void aDelayedCreateRemainsJournaledUntilItCanBeReconciled() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("delayed-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.failNetworkAfterDispatch = true;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), CancellationToken.NONE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ambiguous");
+        DockerResourceRecord dispatched = journal.findOpenByLab(
+                        new LabOwnership(lab.id(), lab.projectId()))
+                .getFirst();
+        assertThat(dispatched.state()).isEqualTo(DockerResourceState.DISPATCHED);
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.FAILED);
+
+        engine.materializeDelayedNetwork();
+        LabRecord stopped = lifecycle.stop(lab.id());
+
+        assertThat(stopped.state()).isEqualTo(LabState.STOPPED);
+        assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("network-"));
+        assertThat(journal.findOpenByLab(dispatched.ownership())).isEmpty();
+    }
+
+    @Test
+    void cancelledStartCleansEphemeralResourcesAndEndsStopped() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("cancel-workspace"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        AtomicBoolean cancelled = new AtomicBoolean();
+        engine.afterStart = () -> cancelled.set(true);
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), cancelled::get))
+                .isInstanceOf(DockerOperationCancelledException.class);
+
+        assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+        assertThat(engine.resources.keySet()).anyMatch(id -> id.startsWith("volume-"));
+        assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("container-"));
+        assertThat(engine.resources.keySet()).noneMatch(id -> id.startsWith("network-"));
+    }
+
     private DockerLabLifecycle lifecycle(
             FakeEngine engine, MemoryJournal journal, MemoryLabRepository labs) {
         AtomicInteger tokens = new AtomicInteger();
@@ -118,9 +191,13 @@ class DockerLabLifecycleTests {
     }
 
     private static LabRecord lab(Path workspace) {
+        return lab(workspace, LabState.IMPORTED);
+    }
+
+    private static LabRecord lab(Path workspace, LabState state) {
         return new LabRecord(
                 "lab-a", "project-a", "Lifecycle lab", 1, workspace,
-                LabState.IMPORTED, 0, NOW, NOW);
+                state, 0, NOW, NOW);
     }
 
     private static ManifestPlan plan() {
@@ -189,25 +266,61 @@ class DockerLabLifecycleTests {
         }
 
         @Override
-        public boolean activate(String token, String engineId, Instant updatedAt) {
+        public boolean markDispatched(String token, Instant updatedAt) {
             DockerResourceRecord current = records.get(token);
             if (current == null || current.state() != DockerResourceState.RESERVED) {
                 return false;
             }
-            records.put(token, current.activate(engineId, updatedAt));
+            records.put(token, current.dispatch(updatedAt));
             return true;
         }
 
         @Override
-        public boolean markRemoved(String token, Optional<String> expectedEngineId, Instant updatedAt) {
+        public boolean activate(
+                String token, String engineId, Optional<String> engineIdentity, Instant updatedAt) {
+            DockerResourceRecord current = records.get(token);
+            if (current == null || current.state() != DockerResourceState.DISPATCHED) {
+                return false;
+            }
+            records.put(token, current.activate(
+                    new DockerCreatedResource(engineId, engineIdentity), updatedAt));
+            return true;
+        }
+
+        @Override
+        public boolean discardReservation(String token, Instant updatedAt) {
+            return discardPending(token, DockerResourceState.RESERVED, updatedAt);
+        }
+
+        @Override
+        public boolean closeDispatchWithoutResource(String token, Instant updatedAt) {
+            return discardPending(token, DockerResourceState.DISPATCHED, updatedAt);
+        }
+
+        @Override
+        public boolean markRemoved(String token, String expectedEngineId, Instant updatedAt) {
             DockerResourceRecord current = records.get(token);
             if (current == null || current.state() == DockerResourceState.REMOVED
-                    || !current.engineId().equals(expectedEngineId)) {
+                    || !current.engineId().equals(Optional.ofNullable(expectedEngineId))) {
                 return false;
             }
             records.put(token, new DockerResourceRecord(
                     current.ownershipToken(), current.ownership(), current.type(), current.logicalName(),
-                    current.engineId(), DockerResourceState.REMOVED, current.createdAt(), updatedAt));
+                    current.engineId(), current.engineIdentity(), DockerResourceState.REMOVED,
+                    current.createdAt(), updatedAt));
+            return true;
+        }
+
+        private boolean discardPending(
+                String token, DockerResourceState expected, Instant updatedAt) {
+            DockerResourceRecord current = records.get(token);
+            if (current == null || current.state() != expected || current.engineId().isPresent()) {
+                return false;
+            }
+            records.put(token, new DockerResourceRecord(
+                    current.ownershipToken(), current.ownership(), current.type(), current.logicalName(),
+                    Optional.empty(), Optional.empty(), DockerResourceState.REMOVED,
+                    current.createdAt(), updatedAt));
             return true;
         }
 
@@ -236,6 +349,9 @@ class DockerLabLifecycleTests {
         private final Map<String, DockerContainerSpec> createdSpecifications = new LinkedHashMap<>();
         private final List<String> calls = new ArrayList<>();
         private CancellationToken pullCancellation;
+        private boolean failNetworkAfterDispatch;
+        private DockerResourceRecord delayedNetwork;
+        private Runnable afterStart = () -> {};
 
         void addImage(String reference, String id) {
             DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of());
@@ -261,35 +377,54 @@ class DockerLabLifecycleTests {
         }
 
         @Override
-        public Optional<String> reconcileReserved(DockerResourceRecord reserved) {
+        public Optional<DockerCreatedResource> reconcileDispatched(DockerResourceRecord dispatched) {
             return resources.entrySet().stream()
-                    .filter(entry -> reserved.equals(entry.getValue()))
-                    .map(Map.Entry::getKey)
+                    .filter(entry -> dispatched.equals(entry.getValue()))
+                    .map(entry -> created(entry.getKey(), entry.getValue()))
                     .findFirst();
         }
 
         @Override
-        public String createNetwork(DockerResourceRecord reserved) {
-            return create("network", reserved, null);
+        public DockerCreatedResource createNetwork(DockerResourceRecord dispatched) {
+            if (failNetworkAfterDispatch) {
+                failNetworkAfterDispatch = false;
+                delayedNetwork = dispatched;
+                throw new IllegalStateException("simulated lost create response");
+            }
+            return create("network", dispatched, null);
+        }
+
+        void materializeDelayedNetwork() {
+            DockerResourceRecord dispatched = java.util.Objects.requireNonNull(delayedNetwork);
+            resources.put("network-" + dispatched.logicalName(), dispatched);
+            delayedNetwork = null;
         }
 
         @Override
-        public String createVolume(DockerResourceRecord reserved) {
-            return create("volume", reserved, null);
+        public DockerCreatedResource createVolume(DockerResourceRecord dispatched) {
+            return create("volume", dispatched, null);
         }
 
         @Override
-        public String createContainer(DockerResourceRecord reserved, DockerContainerSpec specification) {
-            String id = create("container", reserved, specification);
-            createdSpecifications.put(id, specification);
-            return id;
+        public DockerCreatedResource createContainer(
+                DockerResourceRecord dispatched, DockerContainerSpec specification) {
+            DockerCreatedResource created = create("container", dispatched, specification);
+            createdSpecifications.put(created.id(), specification);
+            return created;
         }
 
-        private String create(String prefix, DockerResourceRecord reserved, DockerContainerSpec specification) {
-            String id = prefix + "-" + reserved.logicalName();
-            resources.put(id, reserved);
+        private DockerCreatedResource create(
+                String prefix, DockerResourceRecord dispatched, DockerContainerSpec specification) {
+            String id = prefix + "-" + dispatched.logicalName();
+            resources.put(id, dispatched);
             calls.add("create:" + id);
-            return id;
+            return created(id, dispatched);
+        }
+
+        private static DockerCreatedResource created(String id, DockerResourceRecord dispatched) {
+            return dispatched.type() == DockerResourceType.VOLUME
+                    ? DockerCreatedResource.identified(id, "created-" + dispatched.ownershipToken())
+                    : DockerCreatedResource.withImmutableId(id);
         }
 
         @Override
@@ -304,6 +439,7 @@ class DockerLabLifecycleTests {
         public void startContainer(DockerResourceRecord active) {
             requireOwned(active.engineId().orElseThrow(), active);
             calls.add("start:" + active.engineId().orElseThrow());
+            afterStart.run();
         }
 
         @Override

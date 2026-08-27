@@ -172,7 +172,7 @@ public class DockerLabLifecycle {
                             ownership,
                             DockerResourceType.CONTAINER,
                             service.id(),
-                            reserved -> engine.createContainer(reserved, specification)));
+                            dispatched -> engine.createContainer(dispatched, specification)));
                 }
 
                 List<DockerContainerView> views = new ArrayList<>();
@@ -187,6 +187,9 @@ public class DockerLabLifecycle {
                         network.engineId().orElseThrow(),
                         volumes.values().stream().map(value -> value.engineId().orElseThrow()).toList(),
                         views);
+            } catch (DockerOperationCancelledException cancellationFailure) {
+                finishCancelledStart(starting, ownership, cancellationFailure);
+                throw cancellationFailure;
             } catch (RuntimeException failure) {
                 try {
                     cleanupEphemeralResources(ownership, CancellationToken.NONE);
@@ -287,8 +290,8 @@ public class DockerLabLifecycle {
             return createTracked(ownership, DockerResourceType.VOLUME, logicalName, engine::createVolume);
         }
         DockerResourceRecord record = existing.orElseThrow();
-        if (record.state() == DockerResourceState.RESERVED) {
-            return finishReserved(record, engine::createVolume);
+        if (record.state() != DockerResourceState.ACTIVE) {
+            throw new IllegalStateException("A pending persistent volume must be recovered before reuse.");
         }
         engine.verifyVolume(record);
         return record;
@@ -298,58 +301,67 @@ public class DockerLabLifecycle {
             LabOwnership ownership,
             DockerResourceType type,
             String logicalName,
-            Function<DockerResourceRecord, String> create) {
+            Function<DockerResourceRecord, DockerCreatedResource> create) {
         if (journal.findOpen(ownership, type, logicalName).isPresent()) {
             throw new IllegalStateException("An open Docker resource already uses the planned logical name.");
         }
         DockerResourceRecord reserved = DockerResourceRecord.reserved(
                 tokenSupplier.get(), ownership, type, logicalName, now());
         journal.reserve(reserved);
-        return finishReserved(reserved, create);
+        Instant dispatchedAt = now();
+        DockerResourceRecord dispatched = reserved.dispatch(dispatchedAt);
+        if (!journal.markDispatched(reserved.ownershipToken(), dispatchedAt)) {
+            if (!journal.discardReservation(reserved.ownershipToken(), now())) {
+                throw new IllegalStateException("The Docker resource reservation could not be closed.");
+            }
+            throw new IllegalStateException("The Docker resource dispatch could not be recorded.");
+        }
+        return finishDispatched(dispatched, create);
     }
 
-    private DockerResourceRecord finishReserved(
-            DockerResourceRecord reserved, Function<DockerResourceRecord, String> create) {
-        Optional<String> reconciled = engine.reconcileReserved(reserved);
-        String id;
-        if (reconciled.isPresent()) {
-            id = reconciled.orElseThrow();
-        } else {
-            try {
-                id = create.apply(reserved);
-            } catch (DockerOwnershipException ownershipFailure) {
-                Optional<String> unsafeCreated = engine.reconcileReserved(reserved);
-                if (unsafeCreated.isPresent()) {
-                    DockerResourceRecord active = activate(reserved, unsafeCreated.orElseThrow());
-                    rollbackCreatedResource(active);
-                } else {
-                    journal.markRemoved(reserved.ownershipToken(), Optional.empty(), now());
-                }
-                throw ownershipFailure;
-            } catch (RuntimeException ambiguousFailure) {
-                Optional<String> recovered = engine.reconcileReserved(reserved);
-                if (recovered.isEmpty()) {
-                    journal.markRemoved(reserved.ownershipToken(), Optional.empty(), now());
-                    throw ambiguousFailure;
-                }
-                id = recovered.orElseThrow();
+    private DockerResourceRecord finishDispatched(
+            DockerResourceRecord dispatched,
+            Function<DockerResourceRecord, DockerCreatedResource> create) {
+        DockerCreatedResource created;
+        try {
+            created = create.apply(dispatched);
+        } catch (DockerCreateWithoutOwnedResourceException noOwnedResource) {
+            if (!journal.closeDispatchWithoutResource(dispatched.ownershipToken(), now())) {
+                throw new IllegalStateException(
+                        "The rejected Docker create remained open for safe recovery.", noOwnedResource);
+            }
+            throw noOwnedResource;
+        } catch (RuntimeException ambiguousFailure) {
+            Optional<DockerCreatedResource> recovered = engine.reconcileDispatched(dispatched);
+            if (recovered.isEmpty()) {
+                throw new IllegalStateException(
+                        "The Docker create outcome is still ambiguous and remains journaled.",
+                        ambiguousFailure);
+            }
+            created = recovered.orElseThrow();
+            if (ambiguousFailure instanceof DockerOwnershipException) {
+                DockerResourceRecord active = activate(dispatched, created);
+                rollbackCreatedResource(active);
+                throw ambiguousFailure;
             }
         }
-        return activate(reserved, id);
+        return activate(dispatched, created);
     }
 
-    private DockerResourceRecord activate(DockerResourceRecord reserved, String id) {
+    private DockerResourceRecord activate(
+            DockerResourceRecord dispatched, DockerCreatedResource created) {
         Instant activatedAt = now();
-        DockerResourceRecord active = reserved.activate(id, activatedAt);
-        if (!journal.activate(reserved.ownershipToken(), id, activatedAt)) {
+        DockerResourceRecord active = dispatched.activate(created, activatedAt);
+        if (!journal.activate(
+                dispatched.ownershipToken(), created.id(), created.identity(), activatedAt)) {
             if (active.type() == DockerResourceType.VOLUME) {
                 throw new IllegalStateException(
-                        "The persistent Docker volume remains reserved for safe recovery.");
+                        "The persistent Docker volume remains dispatched for safe recovery.");
             }
-            rollbackCreatedResource(active);
-            if (!journal.markRemoved(reserved.ownershipToken(), Optional.empty(), now())) {
+            rollbackEngineResource(active);
+            if (!journal.closeDispatchWithoutResource(dispatched.ownershipToken(), now())) {
                 throw new IllegalStateException(
-                        "The Docker resource was rolled back but its reservation could not be closed.");
+                        "The rolled-back Docker dispatch could not be closed in its journal.");
             }
             throw new IllegalStateException("The Docker resource could not be activated in its journal.");
         }
@@ -360,13 +372,19 @@ public class DockerLabLifecycle {
         if (active.type() == DockerResourceType.VOLUME) {
             return;
         }
+        rollbackEngineResource(active);
+        if (!journal.markRemoved(active.ownershipToken(), active.engineId().orElseThrow(), now())) {
+            throw new IllegalStateException("The rolled-back Docker resource could not be closed.");
+        }
+    }
+
+    private void rollbackEngineResource(DockerResourceRecord active) {
         if (active.type() == DockerResourceType.CONTAINER) {
             engine.stopContainer(active, STOP_TIMEOUT);
             engine.removeContainer(active);
         } else {
             engine.removeNetwork(active);
         }
-        journal.markRemoved(active.ownershipToken(), active.engineId(), now());
     }
 
     private void cleanupEphemeralResources(
@@ -376,12 +394,16 @@ public class DockerLabLifecycle {
         for (DockerResourceRecord resource : open) {
             cancellation.throwIfCancellationRequested();
             if (resource.state() == DockerResourceState.RESERVED) {
-                Optional<String> match = engine.reconcileReserved(resource);
+                if (!journal.discardReservation(resource.ownershipToken(), now())) {
+                    throw new IllegalStateException("A pre-dispatch Docker reservation could not be closed.");
+                }
+                continue;
+            }
+            if (resource.state() == DockerResourceState.DISPATCHED) {
+                Optional<DockerCreatedResource> match = engine.reconcileDispatched(resource);
                 if (match.isEmpty()) {
-                    if (!journal.markRemoved(resource.ownershipToken(), Optional.empty(), now())) {
-                        throw new IllegalStateException("A stale Docker reservation could not be closed.");
-                    }
-                    continue;
+                    throw new IllegalStateException(
+                            "A dispatched Docker create is still ambiguous and remains journaled.");
                 }
                 resource = activate(resource, match.orElseThrow());
             }
@@ -413,8 +435,41 @@ public class DockerLabLifecycle {
     }
 
     private void markActiveRemoved(DockerResourceRecord resource) {
-        if (!journal.markRemoved(resource.ownershipToken(), resource.engineId(), now())) {
+        if (!journal.markRemoved(
+                resource.ownershipToken(), resource.engineId().orElseThrow(), now())) {
             throw new IllegalStateException("A removed Docker resource could not be closed in its journal.");
+        }
+    }
+
+    private void finishCancelledStart(
+            LabRecord starting,
+            LabOwnership ownership,
+            DockerOperationCancelledException cancellationFailure) {
+        Instant stoppingAt = now();
+        LabRecord stopping = starting.transitionTo(LabState.STOPPING, stoppingAt);
+        boolean stoppingStored = labs.compareAndSetState(
+                starting.id(), starting.revision(), LabState.STARTING, LabState.STOPPING, stoppingAt);
+        if (!stoppingStored) {
+            cancellationFailure.addSuppressed(
+                    new IllegalStateException("The cancelled lab could not enter the stopping state."));
+        }
+        try {
+            cleanupEphemeralResources(ownership, CancellationToken.NONE);
+        } catch (RuntimeException cleanupFailure) {
+            cancellationFailure.addSuppressed(cleanupFailure);
+            if (stoppingStored) {
+                labs.compareAndSetState(
+                        stopping.id(), stopping.revision(), LabState.STOPPING, LabState.FAILED, now());
+            }
+            return;
+        }
+        if (stoppingStored) {
+            Instant stoppedAt = now();
+            if (!labs.compareAndSetState(
+                    stopping.id(), stopping.revision(), LabState.STOPPING, LabState.STOPPED, stoppedAt)) {
+                cancellationFailure.addSuppressed(
+                        new IllegalStateException("The cancelled lab cleanup state could not be stored."));
+            }
         }
     }
 

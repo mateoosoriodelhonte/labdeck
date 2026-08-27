@@ -46,49 +46,70 @@ public class SQLiteDockerResourceJournal implements DockerResourceJournal {
     }
 
     @Override
-    public boolean activate(String ownershipToken, String engineId, Instant updatedAt) {
+    public boolean markDispatched(String ownershipToken, Instant updatedAt) {
         DockerResourceRecord.requireOwnershipToken(ownershipToken);
-        requireEngineId(engineId);
         requireTimestamp(updatedAt);
         return jdbc.update("""
                 UPDATE docker_resource
-                SET engine_id = ?, lifecycle_state = 'ACTIVE', updated_at_epoch_ms = ?
+                SET lifecycle_state = 'DISPATCHED', updated_at_epoch_ms = ?
                 WHERE ownership_token = ?
                   AND lifecycle_state = 'RESERVED'
                   AND engine_id IS NULL
+                  AND engine_identity IS NULL
                   AND updated_at_epoch_ms <= ?
                 """,
-                engineId, updatedAt.toEpochMilli(), ownershipToken, updatedAt.toEpochMilli()) == 1;
+                updatedAt.toEpochMilli(), ownershipToken, updatedAt.toEpochMilli()) == 1;
     }
 
     @Override
-    public boolean markRemoved(
-            String ownershipToken, Optional<String> expectedEngineId, Instant updatedAt) {
+    public boolean activate(
+            String ownershipToken,
+            String engineId,
+            Optional<String> engineIdentity,
+            Instant updatedAt) {
         DockerResourceRecord.requireOwnershipToken(ownershipToken);
-        expectedEngineId = expectedEngineId == null ? Optional.empty() : expectedEngineId;
-        expectedEngineId.ifPresent(SQLiteDockerResourceJournal::requireEngineId);
+        requireEngineId(engineId);
+        engineIdentity = engineIdentity == null ? Optional.empty() : engineIdentity;
+        engineIdentity.ifPresent(SQLiteDockerResourceJournal::requireEngineIdentity);
         requireTimestamp(updatedAt);
-        if (expectedEngineId.isPresent()) {
-            return jdbc.update("""
-                    UPDATE docker_resource
-                    SET lifecycle_state = 'REMOVED', updated_at_epoch_ms = ?
-                    WHERE ownership_token = ?
-                      AND lifecycle_state = 'ACTIVE'
-                      AND engine_id = ?
-                      AND updated_at_epoch_ms <= ?
-                    """,
-                    updatedAt.toEpochMilli(), ownershipToken, expectedEngineId.orElseThrow(),
-                    updatedAt.toEpochMilli()) == 1;
-        }
+        return jdbc.update("""
+                UPDATE docker_resource
+                SET engine_id = ?, engine_identity = ?, lifecycle_state = 'ACTIVE', updated_at_epoch_ms = ?
+                WHERE ownership_token = ?
+                  AND lifecycle_state = 'DISPATCHED'
+                  AND engine_id IS NULL
+                  AND engine_identity IS NULL
+                  AND updated_at_epoch_ms <= ?
+                """,
+                engineId, engineIdentity.orElse(null), updatedAt.toEpochMilli(), ownershipToken,
+                updatedAt.toEpochMilli()) == 1;
+    }
+
+    @Override
+    public boolean discardReservation(String ownershipToken, Instant updatedAt) {
+        return discardPending(ownershipToken, DockerResourceState.RESERVED, updatedAt);
+    }
+
+    @Override
+    public boolean closeDispatchWithoutResource(String ownershipToken, Instant updatedAt) {
+        return discardPending(ownershipToken, DockerResourceState.DISPATCHED, updatedAt);
+    }
+
+    @Override
+    public boolean markRemoved(String ownershipToken, String expectedEngineId, Instant updatedAt) {
+        DockerResourceRecord.requireOwnershipToken(ownershipToken);
+        requireEngineId(expectedEngineId);
+        requireTimestamp(updatedAt);
         return jdbc.update("""
                 UPDATE docker_resource
                 SET lifecycle_state = 'REMOVED', updated_at_epoch_ms = ?
                 WHERE ownership_token = ?
-                  AND lifecycle_state = 'RESERVED'
-                  AND engine_id IS NULL
+                  AND lifecycle_state = 'ACTIVE'
+                  AND engine_id = ?
                   AND updated_at_epoch_ms <= ?
                 """,
-                updatedAt.toEpochMilli(), ownershipToken, updatedAt.toEpochMilli()) == 1;
+                updatedAt.toEpochMilli(), ownershipToken, expectedEngineId,
+                updatedAt.toEpochMilli()) == 1;
     }
 
     @Override
@@ -100,10 +121,11 @@ public class SQLiteDockerResourceJournal implements DockerResourceJournal {
         DockerResourceRecord.requireLogicalName(logicalName);
         List<DockerResourceRecord> matches = jdbc.query("""
                 SELECT ownership_token, lab_id, project_id, resource_type, logical_name,
-                       engine_id, lifecycle_state, created_at_epoch_ms, updated_at_epoch_ms
+                       engine_id, engine_identity, lifecycle_state,
+                       created_at_epoch_ms, updated_at_epoch_ms
                 FROM docker_resource
                 WHERE lab_id = ? AND project_id = ? AND resource_type = ? AND logical_name = ?
-                  AND lifecycle_state IN ('RESERVED', 'ACTIVE')
+                  AND lifecycle_state IN ('RESERVED', 'DISPATCHED', 'ACTIVE')
                 """, ROW_MAPPER, ownership.labId(), ownership.projectId(), type.name(), logicalName);
         if (matches.size() > 1) {
             throw new IllegalStateException("The Docker resource journal has ambiguous open records.");
@@ -118,10 +140,11 @@ public class SQLiteDockerResourceJournal implements DockerResourceJournal {
         }
         return jdbc.query("""
                 SELECT ownership_token, lab_id, project_id, resource_type, logical_name,
-                       engine_id, lifecycle_state, created_at_epoch_ms, updated_at_epoch_ms
+                       engine_id, engine_identity, lifecycle_state,
+                       created_at_epoch_ms, updated_at_epoch_ms
                 FROM docker_resource
                 WHERE lab_id = ? AND project_id = ?
-                  AND lifecycle_state IN ('RESERVED', 'ACTIVE')
+                  AND lifecycle_state IN ('RESERVED', 'DISPATCHED', 'ACTIVE')
                 ORDER BY CASE resource_type
                     WHEN 'CONTAINER' THEN 1 WHEN 'NETWORK' THEN 2 ELSE 3 END,
                     logical_name, ownership_token
@@ -136,6 +159,7 @@ public class SQLiteDockerResourceJournal implements DockerResourceJournal {
                 DockerResourceType.valueOf(results.getString("resource_type")),
                 results.getString("logical_name"),
                 Optional.ofNullable(engineId),
+                Optional.ofNullable(results.getString("engine_identity")),
                 DockerResourceState.valueOf(results.getString("lifecycle_state")),
                 Instant.ofEpochMilli(results.getLong("created_at_epoch_ms")),
                 Instant.ofEpochMilli(results.getLong("updated_at_epoch_ms")));
@@ -146,6 +170,35 @@ public class SQLiteDockerResourceJournal implements DockerResourceJournal {
                 || !engineId.equals(engineId.strip())) {
             throw new IllegalArgumentException("The Docker engine ID is not valid.");
         }
+    }
+
+    private static void requireEngineIdentity(String identity) {
+        if (identity == null || identity.isBlank() || identity.length() > 255
+                || !identity.equals(identity.strip())
+                || identity.codePoints().anyMatch(Character::isISOControl)) {
+            throw new IllegalArgumentException("The Docker Engine identity is not valid.");
+        }
+    }
+
+    private boolean discardPending(
+            String ownershipToken, DockerResourceState expectedState, Instant updatedAt) {
+        DockerResourceRecord.requireOwnershipToken(ownershipToken);
+        if (expectedState != DockerResourceState.RESERVED
+                && expectedState != DockerResourceState.DISPATCHED) {
+            throw new IllegalArgumentException("A pending Docker resource state is required.");
+        }
+        requireTimestamp(updatedAt);
+        return jdbc.update("""
+                UPDATE docker_resource
+                SET lifecycle_state = 'REMOVED', updated_at_epoch_ms = ?
+                WHERE ownership_token = ?
+                  AND lifecycle_state = ?
+                  AND engine_id IS NULL
+                  AND engine_identity IS NULL
+                  AND updated_at_epoch_ms <= ?
+                """,
+                updatedAt.toEpochMilli(), ownershipToken, expectedState.name(),
+                updatedAt.toEpochMilli()) == 1;
     }
 
     private static void requireTimestamp(Instant updatedAt) {
