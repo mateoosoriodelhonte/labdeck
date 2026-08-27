@@ -14,6 +14,8 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.Pattern;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.CacheControl;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.MediaType;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -24,6 +26,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 @RestController
 @Validated
@@ -33,9 +36,11 @@ public class LabController {
     private static final String LAB_ID = "[A-Za-z0-9][A-Za-z0-9_-]{0,63}";
 
     private final LabApiService labs;
+    private final LabLogStreamService logStreams;
 
-    public LabController(LabApiService labs) {
+    public LabController(LabApiService labs, LabLogStreamService logStreams) {
         this.labs = labs;
+        this.logStreams = logStreams;
     }
 
     @GetMapping
@@ -74,8 +79,23 @@ public class LabController {
     }
 
     @GetMapping("/{id}/logs")
-    public LogListResponse logs(@PathVariable @Pattern(regexp = LAB_ID) String id) {
-        return labs.logs(id);
+    public ResponseEntity<LogListResponse> logs(
+            @PathVariable @Pattern(regexp = LAB_ID) String id,
+            @RequestParam @Pattern(regexp = "[a-z][a-z0-9-]{0,31}") String service,
+            @RequestParam(defaultValue = "200") @Min(1) @Max(500) int tail) {
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore())
+                .body(labs.logs(id, service, tail));
+    }
+
+    @GetMapping(path = "/{id}/logs/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public ResponseEntity<SseEmitter> streamLogs(
+            @PathVariable @Pattern(regexp = LAB_ID) String id,
+            @RequestParam @Pattern(regexp = "[a-z][a-z0-9-]{0,31}") String service,
+            @RequestParam(defaultValue = "100") @Min(1) @Max(200) int tail) {
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore())
+                .body(logStreams.open(id, service, tail));
     }
 
     @GetMapping("/{id}/tests")

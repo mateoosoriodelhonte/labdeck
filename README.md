@@ -27,11 +27,13 @@ less time fighting dependencies and more time working on the assignment.
 - Dynamic or fixed TCP ports bound only to `127.0.0.1`, with clear fixed-port conflicts.
 - Lab-wide memory and CPU ceilings divided across services, with Docker swap disabled.
 - Docker health readiness, bounded cancellation, unexpected-exit monitoring, and safe failure records.
+- Exact-owned service metrics, stable topology, endpoints, and honest disk-use availability.
+- Rotated local Docker logs with bounded history, bounded server-sent streams, and Stop cancellation.
 - Typed image-download and Docker-storage-full guidance without automatic pruning.
 - Workspace identity checks before structured bind mounts; no general Docker prune operations.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.
-- Unit, contract, build, and browser smoke checks for the bootstrap.
+- Unit, API contract, package, and real Docker integration checks for the implemented foundation.
 
 ## Build and run
 
@@ -104,7 +106,8 @@ Architecture decisions are recorded in
 [ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md), and
 [ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md), and
 [ADR-0005](docs/decisions/0005-local-ports-resource-budgets-and-readiness.md), and
-[ADR-0006](docs/decisions/0006-safe-local-api.md).
+[ADR-0006](docs/decisions/0006-safe-local-api.md), and
+[ADR-0007](docs/decisions/0007-bounded-owned-observability-and-logs.md).
 
 ## Safety and privacy
 
@@ -141,3 +144,5 @@ Ports, resource limits, and health readiness are tracked in
 [issue #6](https://github.com/mateoosoriodelhonte/labdeck/issues/6).
 The safe local API is tracked in
 [issue #7](https://github.com/mateoosoriodelhonte/labdeck/issues/7).
+Bounded observability and logs are tracked in
+[issue #8](https://github.com/mateoosoriodelhonte/labdeck/issues/8).

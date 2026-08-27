@@ -27,9 +27,18 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +49,7 @@ public class DockerLabLifecycle implements AutoCloseable {
 
     private static final Duration STOP_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration PULL_TIMEOUT = Duration.ofMinutes(15);
+    private static final Duration OBSERVATION_TIMEOUT = Duration.ofSeconds(5);
 
     private final DockerEnginePort engine;
     private final DockerResourceJournal journal;
@@ -52,6 +62,9 @@ public class DockerLabLifecycle implements AutoCloseable {
     private final ConcurrentHashMap<String, ReentrantLock> labLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ActiveStart> activeStarts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Integer> stopRequests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Set<TrackedLogSubscription>> logSubscriptions =
+            new ConcurrentHashMap<>();
+    private final ExecutorService observationExecutor = newObservationExecutor();
 
     @Autowired
     public DockerLabLifecycle(
@@ -250,6 +263,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                             .toList();
                     DockerContainerSpec specification = new DockerContainerSpec(
                             image.id(),
+                            ((ImageSource) service.definition().source()).reference(),
                             service.definition().workingDirectory(),
                             service.definition().command(),
                             service.definition().environment(),
@@ -347,6 +361,7 @@ public class DockerLabLifecycle implements AutoCloseable {
             ReentrantLock lock = lockFor(labId);
             lock.lock();
             try {
+                cancelLogSubscriptions(labId);
                 LabRecord current = labs.findById(labId)
                         .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
                 if (expectedRevision != null && current.revision() != expectedRevision.longValue()) {
@@ -435,6 +450,181 @@ public class DockerLabLifecycle implements AutoCloseable {
                     containers.stream().map(engine::inspectContainerSnapshot).toList());
         } finally {
             unlock(lock);
+        }
+    }
+
+    public DockerObservabilitySnapshot inspectObservabilitySnapshot(String labId) {
+        if (labId == null || !labId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+            throw new IllegalArgumentException("The lab ID is not valid.");
+        }
+        ReentrantLock lock = lockFor(labId);
+        LabRecord observedLab;
+        List<DockerResourceRecord> active;
+        lock.lock();
+        try {
+            observedLab = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            LabOwnership ownership = new LabOwnership(observedLab.id(), observedLab.projectId());
+            active = journal.findOpenByLab(ownership).stream()
+                    .filter(resource -> resource.state() == DockerResourceState.ACTIVE)
+                    .toList();
+        } finally {
+            unlock(lock);
+        }
+        ObservationResult observation;
+        if (active.isEmpty()) {
+            observation = new ObservationResult(List.of(), List.of(), false);
+        } else {
+            try {
+                observation = inspectWithinDeadline(active);
+            } catch (RuntimeException failure) {
+                throwIfObservationIsStale(lock, labId, observedLab);
+                throw failure;
+            }
+        }
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            requireCurrentObservation(current, observedLab);
+            return new DockerObservabilitySnapshot(
+                    current,
+                    observation.services(),
+                    observation.volumes(),
+                    observation.networkPresent());
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    private ObservationResult inspectWithinDeadline(List<DockerResourceRecord> active) {
+        Future<ObservationResult> future;
+        try {
+            future = observationExecutor.submit(() -> inspectActiveResources(active));
+        } catch (RejectedExecutionException failure) {
+            throw new DockerObservationTimeoutException();
+        }
+        try {
+            return future.get(OBSERVATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException failure) {
+            future.cancel(true);
+            throw new DockerObservationTimeoutException();
+        } catch (InterruptedException failure) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new DockerObservationTimeoutException();
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException("Docker observation failed safely.");
+        }
+    }
+
+    private ObservationResult inspectActiveResources(List<DockerResourceRecord> active) {
+        engine.verifyAvailable();
+        Map<String, String> ownedVolumes = active.stream()
+                .filter(resource -> resource.type() == DockerResourceType.VOLUME)
+                .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                        resource -> resource.engineId().orElseThrow(),
+                        DockerResourceRecord::logicalName));
+        List<DockerServiceObservation> services = active.stream()
+                .filter(resource -> resource.type() == DockerResourceType.CONTAINER)
+                .sorted(java.util.Comparator.comparing(DockerResourceRecord::logicalName))
+                .map(resource -> engine.inspectContainerObservation(resource, ownedVolumes))
+                .toList();
+        List<DockerVolumeObservation> volumes = active.stream()
+                .filter(resource -> resource.type() == DockerResourceType.VOLUME)
+                .sorted(java.util.Comparator.comparing(DockerResourceRecord::logicalName))
+                .map(engine::inspectVolumeObservation)
+                .toList();
+        List<DockerResourceRecord> networks = active.stream()
+                .filter(resource -> resource.type() == DockerResourceType.NETWORK)
+                .toList();
+        if (networks.size() > 1) {
+            throw new DockerOwnershipException("The lab has more than one active Docker network.");
+        }
+        networks.forEach(engine::verifyNetwork);
+        return new ObservationResult(services, volumes, !networks.isEmpty());
+    }
+
+    private void throwIfObservationIsStale(
+            ReentrantLock lock, String labId, LabRecord observedLab) {
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            requireCurrentObservation(current, observedLab);
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    private static void requireCurrentObservation(LabRecord current, LabRecord observed) {
+        if (current.revision() != observed.revision() || current.state() != observed.state()) {
+            throw new IllegalStateException(
+                    "The lab changed during Docker observation. Refresh and retry.");
+        }
+    }
+
+    public DockerLogBatch readLogs(String labId, String service, int tail) {
+        ActiveLogTarget target = resolveActiveContainer(labId, service);
+        engine.verifyAvailable();
+        return engine.readContainerLogs(target.container(), tail);
+    }
+
+    public DockerLogSubscription followLogs(
+            String labId, String service, int tail, Consumer<DockerLogLine> consumer) {
+        ActiveLogTarget target = resolveActiveContainer(labId, service);
+        engine.verifyAvailable();
+        DockerLogSubscription delegate = engine.followContainerLogs(
+                target.container(), tail, consumer);
+        TrackedLogSubscription tracked = new TrackedLogSubscription(labId, delegate);
+        ReentrantLock lock = lockFor(labId);
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            if (current.revision() != target.lab().revision()
+                    || current.state() != target.lab().state()) {
+                tracked.close();
+                throw new IllegalStateException(
+                        "The lab changed before the log stream began. Refresh and retry.");
+            }
+            logSubscriptions.computeIfAbsent(
+                    labId, ignored -> ConcurrentHashMap.newKeySet()).add(tracked);
+            return tracked;
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    private ActiveLogTarget resolveActiveContainer(String labId, String service) {
+        if (labId == null || !labId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+            throw new IllegalArgumentException("The lab ID is not valid.");
+        }
+        DockerResourceRecord.requireLogicalName(service);
+        ReentrantLock lock = lockFor(labId);
+        lock.lock();
+        try {
+            LabRecord current = labs.findById(labId)
+                    .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
+            LabOwnership ownership = new LabOwnership(current.id(), current.projectId());
+            DockerResourceRecord container = journal.findOpen(
+                            ownership, DockerResourceType.CONTAINER, service)
+                    .filter(resource -> resource.state() == DockerResourceState.ACTIVE)
+                    .orElseThrow(DockerActiveServiceNotFoundException::new);
+            return new ActiveLogTarget(current, container);
+        } finally {
+            unlock(lock);
+        }
+    }
+
+    private void cancelLogSubscriptions(String labId) {
+        Set<TrackedLogSubscription> active = logSubscriptions.remove(labId);
+        if (active != null) {
+            active.forEach(TrackedLogSubscription::close);
         }
     }
 
@@ -760,6 +950,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                     current.id(), current.revision(), LabState.RUNNING, LabState.STOPPING, stoppingAt)) {
                 return;
             }
+            cancelLogSubscriptions(monitoredRun.id());
             boolean cleanupIncomplete = false;
             if (!failure.engineInspectionFailed() && !failure.ownershipMismatch()) {
                 try {
@@ -792,7 +983,83 @@ public class DockerLabLifecycle implements AutoCloseable {
 
     @Override
     public void close() {
+        List.copyOf(logSubscriptions.keySet()).forEach(this::cancelLogSubscriptions);
+        observationExecutor.shutdownNow();
         runtimeMonitor.close();
+    }
+
+    private static ExecutorService newObservationExecutor() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                4,
+                4,
+                1,
+                TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(4),
+                Thread.ofVirtual().name("labdeck-observation-", 0).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
+    private record ObservationResult(
+            List<DockerServiceObservation> services,
+            List<DockerVolumeObservation> volumes,
+            boolean networkPresent) {}
+
+    private record ActiveLogTarget(LabRecord lab, DockerResourceRecord container) {}
+
+    private final class TrackedLogSubscription implements DockerLogSubscription {
+        private final String labId;
+        private final DockerLogSubscription delegate;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private TrackedLogSubscription(String labId, DockerLogSubscription delegate) {
+            this.labId = labId;
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+        }
+
+        @Override
+        public boolean await(Duration timeout) throws InterruptedException {
+            return delegate.await(timeout);
+        }
+
+        @Override
+        public boolean truncated() {
+            return delegate.truncated();
+        }
+
+        @Override
+        public boolean failed() {
+            return delegate.failed();
+        }
+
+        @Override
+        public boolean closed() {
+            return closed.get() || delegate.closed();
+        }
+
+        @Override
+        public void onClose(Runnable listener) {
+            delegate.onClose(listener);
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                delegate.close();
+            } finally {
+                Set<TrackedLogSubscription> active = logSubscriptions.get(labId);
+                if (active != null) {
+                    active.remove(this);
+                    if (active.isEmpty()) {
+                        logSubscriptions.remove(labId, active);
+                    }
+                }
+            }
+        }
     }
 
     private boolean storeFailure(

@@ -10,10 +10,12 @@ import static org.mockito.Mockito.when;
 import io.labdeck.api.LabApiModels.StartLabRequest;
 import io.labdeck.docker.CancellationToken;
 import io.labdeck.docker.DockerContainerView;
+import io.labdeck.docker.DockerContainerMetrics;
 import io.labdeck.docker.DockerHealthStatus;
 import io.labdeck.docker.DockerImagePlan;
 import io.labdeck.docker.DockerLabLifecycle;
-import io.labdeck.docker.DockerServiceSnapshot;
+import io.labdeck.docker.DockerObservabilitySnapshot;
+import io.labdeck.docker.DockerServiceObservation;
 import io.labdeck.docker.DockerStartResult;
 import io.labdeck.lab.LabRecord;
 import io.labdeck.lab.LabRepository;
@@ -37,6 +39,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -179,33 +182,68 @@ class LabApiServiceTests {
     }
 
     @Test
-    void serviceInspectionDoesNotDependOnTheMutableManifestOrExposeImageIds() {
+    void serviceInspectionDoesNotDependOnTheMutableManifestOrExposeEngineIds() {
         LabRecord running = new LabRecord(
                 lab.id(), lab.projectId(), lab.name(), 1, lab.workspace(),
                 LabState.RUNNING, 2, lab.createdAt(), NOW.plusSeconds(2));
         when(labs.findById(lab.id())).thenReturn(Optional.of(running));
         when(manifests.load(lab.workspace())).thenThrow(new AssertionError(
                 "Service inspection must not read the mutable manifest."));
-        when(lifecycle.inspectServiceSnapshot(lab.id())).thenReturn(new DockerServiceSnapshot(
+        when(lifecycle.inspectObservabilitySnapshot(lab.id())).thenReturn(new DockerObservabilitySnapshot(
                 running,
-                List.of(new DockerContainerView(
-                        "private-engine-id",
-                        "app",
-                        "private-generated-name",
-                        "sha256:private-image-id",
-                        "running",
-                        true,
-                        OptionalInt.empty(),
-                        DockerHealthStatus.HEALTHY,
-                        List.of()))));
+                List.of(new DockerServiceObservation(
+                        new DockerContainerView(
+                                "private-engine-id",
+                                "app",
+                                "private-generated-name",
+                                "sha256:private-image-id",
+                                "running",
+                                true,
+                                OptionalInt.empty(),
+                                DockerHealthStatus.HEALTHY,
+                                List.of()),
+                        Optional.of("busybox:1.37"),
+                        DockerContainerMetrics.UNAVAILABLE,
+                        OptionalLong.of(10_000),
+                        OptionalLong.of(100),
+                        List.of(
+                                new io.labdeck.docker.DockerVolumeMountObservation(
+                                        "course-data", "/cache", true),
+                                new io.labdeck.docker.DockerVolumeMountObservation(
+                                        "course-data", "/data", false)))),
+                List.of(new io.labdeck.docker.DockerVolumeObservation(
+                        "course-data", OptionalLong.empty(), "UNAVAILABLE")),
+                true));
 
         var response = service.listServices(lab.id());
 
         assertThat(response.services()).singleElement().satisfies(container -> {
             assertThat(container.service()).isEqualTo("app");
-            assertThat(container.image()).isEqualTo("unavailable");
+            assertThat(container.containerName()).isEqualTo("app");
+            assertThat(container.image()).isEqualTo("busybox:1.37");
             assertThat(container.status()).isEqualTo("running");
+            assertThat(container.imageSizeBytes()).isEqualTo(10_000);
+            assertThat(container.writableLayerBytes()).isEqualTo(100);
         });
+        assertThat(response.topology().nodes())
+                .extracting(node -> node.id())
+                .contains("local-host", "lab-network", "service:app", "volume:course-data");
+        assertThat(response.topology().edges())
+                .anySatisfy(edge -> {
+                    assertThat(edge.kind()).isEqualTo("MOUNTS_VOLUME");
+                    assertThat(edge.from()).isEqualTo("service:app");
+                    assertThat(edge.to()).isEqualTo("volume:course-data");
+                    assertThat(edge.target()).isEqualTo("/data");
+                });
+        assertThat(response.topology().edges().stream()
+                        .filter(edge -> edge.kind().equals("MOUNTS_VOLUME"))
+                        .map(edge -> edge.id())
+                        .distinct())
+                .hasSize(2);
+        assertThat(response.storage().knownWritableBytes()).isEqualTo(100);
+        assertThat(response.cleanupPlan().readOnly()).isTrue();
+        assertThat(response.cleanupPlan().actions())
+                .noneMatch(action -> action.action().contains("DELETE"));
         assertThat(response.revision()).isEqualTo(2);
     }
 

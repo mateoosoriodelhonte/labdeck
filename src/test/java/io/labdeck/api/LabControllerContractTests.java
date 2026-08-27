@@ -14,6 +14,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import io.labdeck.api.LabApiModels.LabDetailResponse;
 import io.labdeck.api.LabApiModels.LabListResponse;
 import io.labdeck.api.LabApiModels.LabSummaryResponse;
+import io.labdeck.api.LabApiModels.LogLineResponse;
+import io.labdeck.api.LabApiModels.LogListResponse;
 import io.labdeck.api.LabApiModels.ManifestPlanResponse;
 import io.labdeck.api.LabApiModels.ResourcePlanResponse;
 import io.labdeck.api.LabApiModels.SettingsResponse;
@@ -61,6 +63,9 @@ class LabControllerContractTests {
 
     @MockitoBean
     private LabApiService labs;
+
+    @MockitoBean
+    private LabLogStreamService logStreams;
 
     @Test
     void exposesTypedLabTemplateAndSettingsContracts() throws Exception {
@@ -240,6 +245,35 @@ class LabControllerContractTests {
                 .andExpect(jsonPath("$.instance").value("/api/v1"))
                 .andExpect(jsonPath("$.detail").value(
                         "Docker is not available. Install or start Docker, then retry."));
+    }
+
+    @Test
+    void logHistoryRequiresABoundedServiceQueryAndDisablesCaching() throws Exception {
+        when(labs.logs("lab-1", "app", 20)).thenReturn(new LogListResponse(
+                "v1",
+                "lab-1",
+                "app",
+                "AVAILABLE",
+                List.of(new LogLineResponse(NOW, "app", "STDOUT", "ready")),
+                false));
+
+        mvc.perform(get("/api/v1/labs/lab-1/logs")
+                        .queryParam("service", "app")
+                        .queryParam("tail", "20"))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.service").value("app"))
+                .andExpect(jsonPath("$.lines[0].text").value("ready"));
+        verify(labs).logs("lab-1", "app", 20);
+
+        mvc.perform(get("/api/v1/labs/lab-1/logs"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+        mvc.perform(get("/api/v1/labs/lab-1/logs")
+                        .queryParam("service", "app")
+                        .queryParam("tail", "501"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("REQUEST_VALIDATION_FAILED"));
     }
 
     private void assertMalformed(CsrfSession csrf, String body) throws Exception {

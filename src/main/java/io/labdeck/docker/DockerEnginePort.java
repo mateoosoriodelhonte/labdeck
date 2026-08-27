@@ -1,7 +1,9 @@
 package io.labdeck.docker;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 public interface DockerEnginePort {
 
@@ -29,6 +31,18 @@ public interface DockerEnginePort {
             DockerResourceRecord active, DockerContainerSpec specification);
 
     DockerContainerView inspectContainerSnapshot(DockerResourceRecord active);
+
+    DockerServiceObservation inspectContainerObservation(
+            DockerResourceRecord active, Map<String, String> ownedVolumes);
+
+    DockerVolumeObservation inspectVolumeObservation(DockerResourceRecord active);
+
+    void verifyNetwork(DockerResourceRecord active);
+
+    DockerLogBatch readContainerLogs(DockerResourceRecord active, int tail);
+
+    DockerLogSubscription followContainerLogs(
+            DockerResourceRecord active, int tail, Consumer<DockerLogLine> consumer);
 
     void startContainer(DockerResourceRecord active, DockerContainerSpec specification);
 
