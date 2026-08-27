@@ -136,7 +136,7 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                 cancellation.throwIfCancellationRequested();
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
-                    throw new IllegalStateException("The confirmed public image pull timed out.");
+                    throw new DockerImagePullException(DockerImagePullException.Reason.TIMED_OUT);
                 }
                 long waitNanos = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(100));
                 try {
@@ -148,11 +148,16 @@ public class DockerJavaLabEngine implements DockerEnginePort {
                     throw propagatePullFailure(failure.getCause());
                 }
             }
+        } catch (DockerOperationCancelledException | DockerImagePullException
+                | DockerStorageFullException expected) {
+            throw expected;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("The confirmed public image pull was interrupted.", exception);
+            throw new DockerImagePullException(DockerImagePullException.Reason.INTERRUPTED);
         } catch (IOException exception) {
-            throw new IllegalStateException("The confirmed public image pull could not close safely.", exception);
+            throw new DockerImagePullException(DockerImagePullException.Reason.FAILED);
+        } catch (RuntimeException failure) {
+            throw classifyPullFailure(failure);
         }
     }
 
@@ -208,15 +213,20 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         } catch (RuntimeException preflightFailure) {
             throw createWithoutOwnedResource(preflightFailure);
         }
-        String id = docker.createNetworkCmd()
-                .withName(engineName(dispatched))
-                .withDriver("bridge")
-                .withInternal(false)
-                .withAttachable(false)
-                .withCheckDuplicate(false)
-                .withLabels(dispatched.labels())
-                .exec()
-                .getId();
+        String id;
+        try {
+            id = docker.createNetworkCmd()
+                    .withName(engineName(dispatched))
+                    .withDriver("bridge")
+                    .withInternal(false)
+                    .withAttachable(false)
+                    .withCheckDuplicate(false)
+                    .withLabels(dispatched.labels())
+                    .exec()
+                    .getId();
+        } catch (RuntimeException failure) {
+            throw classifyStorageFailure(failure);
+        }
         requireCreatedId(id);
         var created = docker.inspectNetworkCmd().withNetworkId(id).exec();
         if (!dispatched.hasExactLabels(created.getLabels())
@@ -236,12 +246,17 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         } catch (RuntimeException preflightFailure) {
             throw createWithoutOwnedResource(preflightFailure);
         }
-        String id = docker.createVolumeCmd()
-                .withName(engineName(dispatched))
-                .withDriver("local")
-                .withLabels(dispatched.labels())
-                .exec()
-                .getName();
+        String id;
+        try {
+            id = docker.createVolumeCmd()
+                    .withName(engineName(dispatched))
+                    .withDriver("local")
+                    .withLabels(dispatched.labels())
+                    .exec()
+                    .getName();
+        } catch (RuntimeException failure) {
+            throw classifyStorageFailure(failure);
+        }
         requireCreatedId(id);
         var created = docker.inspectVolumeCmd(id).exec();
         if (!dispatched.hasExactLabels(created.getLabels()) || !"local".equals(created.getDriver())) {
@@ -312,7 +327,12 @@ public class DockerJavaLabEngine implements DockerEnginePort {
         if (!specification.command().isEmpty()) {
             command.withCmd(specification.command());
         }
-        String id = command.exec().getId();
+        String id;
+        try {
+            id = command.exec().getId();
+        } catch (RuntimeException failure) {
+            throw classifyStorageFailure(failure);
+        }
         requireCreatedId(id);
         DockerCreatedResource result = DockerCreatedResource.withImmutableId(id);
         InspectContainerResponse created = inspectOwnedContainer(dispatched.activate(result, dispatched.updatedAt()));
@@ -363,7 +383,7 @@ public class DockerJavaLabEngine implements DockerEnginePort {
             if (!fixedPorts.isEmpty() && isPortCollision(ambiguousFailure)) {
                 throw new DockerPortCollisionException(active.logicalName(), fixedPorts, ambiguousFailure);
             }
-            throw ambiguousFailure;
+            throw classifyStorageFailure(ambiguousFailure);
         }
     }
 
@@ -861,13 +881,46 @@ public class DockerJavaLabEngine implements DockerEnginePort {
     }
 
     private static RuntimeException propagatePullFailure(Throwable cause) {
-        if (cause instanceof RuntimeException runtimeException) {
-            return runtimeException;
-        }
         if (cause instanceof Error error) {
             throw error;
         }
-        return new IllegalStateException("The confirmed public image pull failed.", cause);
+        if (cause instanceof DockerOperationCancelledException cancellation) {
+            return cancellation;
+        }
+        if (cause instanceof RuntimeException runtimeException) {
+            return classifyPullFailure(runtimeException);
+        }
+        return new DockerImagePullException(DockerImagePullException.Reason.FAILED);
+    }
+
+    private static RuntimeException classifyPullFailure(RuntimeException failure) {
+        if (failure instanceof DockerOperationCancelledException
+                || failure instanceof DockerImagePullException
+                || failure instanceof DockerStorageFullException) {
+            return failure;
+        }
+        if (isStorageFull(failure)) {
+            return new DockerStorageFullException();
+        }
+        return new DockerImagePullException(DockerImagePullException.Reason.FAILED);
+    }
+
+    private static RuntimeException classifyStorageFailure(RuntimeException failure) {
+        return isStorageFull(failure) ? new DockerStorageFullException() : failure;
+    }
+
+    private static boolean isStorageFull(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message == null) {
+                continue;
+            }
+            String normalized = message.toLowerCase(java.util.Locale.ROOT);
+            if (normalized.contains("no space left on device") || normalized.contains("enospc")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static DockerCreateWithoutOwnedResourceException createWithoutOwnedResource(

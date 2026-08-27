@@ -24,7 +24,10 @@ public final class DockerPortCollisionException extends IllegalStateException {
     private static String message(String service, List<Integer> hostPorts) {
         String ports = hostPorts.stream().sorted().map(String::valueOf)
                 .collect(java.util.stream.Collectors.joining(", "));
-        return "Service '" + service + "' could not use local port " + ports
+        String conflict = hostPorts.size() == 1
+                ? "local port " + ports + " is already in use"
+                : "one of the local ports " + ports + " is already in use";
+        return "Service '" + service + "': " + conflict
                 + ". Stop the other app or choose a different host port.";
     }
 }

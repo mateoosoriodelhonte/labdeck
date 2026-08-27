@@ -78,7 +78,7 @@ public class SQLiteLabRepository implements LabRepository {
         validateTransition(id, expectedRevision, expected, next, updatedAt);
         Boolean changed = transactions.execute(status -> {
             boolean updated = updateState(id, expectedRevision, expected, next, updatedAt);
-            if (updated && next == LabState.STARTING) {
+            if (updated && (next == LabState.STARTING || next == LabState.STOPPED)) {
                 jdbc.update("DELETE FROM lab_runtime_failure WHERE lab_id = ?", id);
             }
             return updated;

@@ -28,7 +28,7 @@ class DockerReadinessWaiterTests {
 
         assertThat(ready).singleElement().extracting(DockerContainerView::health)
                 .isEqualTo(DockerHealthStatus.HEALTHY);
-        assertThat(checks).hasValue(2);
+        assertThat(checks).hasValue(3);
         assertThat(time).hasValue(Duration.ofMillis(100).toNanos());
     }
 
@@ -69,7 +69,26 @@ class DockerReadinessWaiterTests {
         assertThat(ready).singleElement().extracting(DockerContainerView::health)
                 .isEqualTo(DockerHealthStatus.NONE);
         assertThat(time).hasValue(Duration.ofSeconds(2).toNanos());
-        assertThat(checks).hasValue(21);
+        assertThat(checks).hasValue(22);
+    }
+
+    @Test
+    void aSlowHealthyInspectionCannotCrossTheHardDeadline() {
+        AtomicLong time = new AtomicLong();
+        DockerReadinessWaiter waiter = waiter(time, ignored -> {});
+
+        assertThatThrownBy(() -> waiter.await(
+                List.of(new DockerReadinessWaiter.ServiceProbe("app", true, () -> {
+                    time.addAndGet(Duration.ofSeconds(2).toNanos());
+                    return view("app", DockerHealthStatus.HEALTHY);
+                })),
+                Duration.ofSeconds(1),
+                CancellationToken.NONE))
+                .isInstanceOfSatisfying(DockerServiceReadinessException.class, exception -> {
+                    assertThat(exception.reason())
+                            .isEqualTo(DockerServiceReadinessException.Reason.TIMED_OUT);
+                    assertThat(exception.services()).containsExactly("app");
+                });
     }
 
     @Test

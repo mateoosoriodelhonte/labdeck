@@ -34,7 +34,8 @@ public record LabRuntimeFailure(
 
     public boolean retryable() {
         return switch (code) {
-            case DOCKER_UNAVAILABLE, HOST_PORT_IN_USE, CONTAINER_START_FAILED,
+            case DOCKER_UNAVAILABLE, DOCKER_STORAGE_FULL, IMAGE_PULL_FAILED,
+                    HOST_PORT_IN_USE, CONTAINER_START_FAILED,
                     CONTAINER_EXITED, HEALTHCHECK_UNHEALTHY, STARTUP_TIMEOUT,
                     CLEANUP_INCOMPLETE -> true;
             case OWNERSHIP_MISMATCH -> false;
@@ -45,6 +46,9 @@ public record LabRuntimeFailure(
         String prefix = service.map(value -> "Service '" + value + "': ").orElse("");
         String action = switch (code) {
             case DOCKER_UNAVAILABLE -> "LabDeck could not inspect the local Docker engine. Start Docker and retry.";
+            case DOCKER_STORAGE_FULL -> "Docker storage is full. Free space in Docker storage and retry. "
+                    + "LabDeck did not delete or prune anything.";
+            case IMAGE_PULL_FAILED -> "the image could not be downloaded. Check its name and public access, then retry.";
             case HOST_PORT_IN_USE -> "the fixed local port is in use. Free it or use a dynamic host port.";
             case CONTAINER_START_FAILED -> "the container could not start. Check its command and Docker storage.";
             case CONTAINER_EXITED -> "the container exited unexpectedly. Check its command and logs.";

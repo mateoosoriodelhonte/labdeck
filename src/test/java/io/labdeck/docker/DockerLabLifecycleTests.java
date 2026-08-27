@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -231,6 +232,107 @@ class DockerLabLifecycleTests {
     }
 
     @Test
+    void cancellationThatWinsTheRunningCommitGateCannotReportSuccess() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("cancel-at-commit"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        BlockingClock clock = new BlockingClock();
+        AtomicInteger inspections = new AtomicInteger();
+        engine.afterInspect = () -> {
+            if (inspections.incrementAndGet() == 4) {
+                clock.blockNextInstant();
+            }
+        };
+        AtomicBoolean cancelled = new AtomicBoolean();
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs, clock);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> start = executor.submit(() -> lifecycle.start(lab, plan(), cancelled::get));
+            assertThat(clock.awaitBlocked()).isTrue();
+
+            cancelled.set(true);
+            clock.release();
+
+            assertThatThrownBy(() -> start.get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(DockerOperationCancelledException.class);
+            assertThat(labs.findById(lab.id()).orElseThrow().state()).isEqualTo(LabState.STOPPED);
+            assertThat(engine.resources.keySet())
+                    .noneMatch(id -> id.startsWith("container-") || id.startsWith("network-"));
+        }
+    }
+
+    @Test
+    void failedCleanupRetryStoresANewDurableCleanupFailure() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("failed-cleanup-retry"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.healthStatus = DockerHealthStatus.UNHEALTHY;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), CancellationToken.NONE))
+                .isInstanceOf(DockerServiceReadinessException.class);
+        long failedRevision = labs.findById(lab.id()).orElseThrow().revision();
+        engine.failVolumeVerification = true;
+
+        assertThatThrownBy(() -> lifecycle.stop(lab.id()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("volume verification");
+
+        LabRecord failed = labs.findById(lab.id()).orElseThrow();
+        assertThat(failed.state()).isEqualTo(LabState.FAILED);
+        assertThat(failed.revision()).isEqualTo(failedRevision + 2);
+        assertThat(labs.findRuntimeFailure(lab.id()).orElseThrow())
+                .satisfies(failure -> {
+                    assertThat(failure.code()).isEqualTo(LabFailureCode.CLEANUP_INCOMPLETE);
+                    assertThat(failure.cleanupIncomplete()).isTrue();
+                    assertThat(failure.labRevision()).isEqualTo(failed.revision());
+                });
+    }
+
+    @Test
+    void successfulCleanupRetryClearsTheOldFailure() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("successful-cleanup-retry"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.healthStatus = DockerHealthStatus.UNHEALTHY;
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), CancellationToken.NONE))
+                .isInstanceOf(DockerServiceReadinessException.class);
+
+        assertThat(lifecycle.stop(lab.id()).state()).isEqualTo(LabState.STOPPED);
+        assertThat(labs.findRuntimeFailure(lab.id())).isEmpty();
+    }
+
+    @Test
+    void DockerStorageExhaustionGetsASafeDurableFailure() throws Exception {
+        Path workspace = Files.createDirectories(temporaryDirectory.resolve("storage-full"));
+        LabRecord lab = lab(workspace);
+        MemoryLabRepository labs = new MemoryLabRepository(lab);
+        MemoryJournal journal = new MemoryJournal();
+        FakeEngine engine = new FakeEngine();
+        engine.addImage("busybox:1.37", "sha256:immutable-busybox");
+        engine.startFailure = new DockerStorageFullException();
+        DockerLabLifecycle lifecycle = lifecycle(engine, journal, labs);
+
+        assertThatThrownBy(() -> lifecycle.start(lab, plan(), CancellationToken.NONE))
+                .isInstanceOf(DockerStorageFullException.class)
+                .hasMessageNotContaining("/var/lib/docker");
+
+        LabRuntimeFailure failure = labs.findRuntimeFailure(lab.id()).orElseThrow();
+        assertThat(failure.code()).isEqualTo(LabFailureCode.DOCKER_STORAGE_FULL);
+        assertThat(failure.safeMessage()).contains("did not delete or prune anything");
+    }
+
+    @Test
     void anUnhealthyOrExitedServiceNeverCommitsRunning() throws Exception {
         Path unhealthyWorkspace = Files.createDirectories(temporaryDirectory.resolve("unhealthy"));
         LabRecord unhealthyLab = lab(unhealthyWorkspace);
@@ -399,6 +501,18 @@ class DockerLabLifecycleTests {
     }
 
     private DockerLabLifecycle lifecycle(
+            FakeEngine engine, MemoryJournal journal, MemoryLabRepository labs, Clock clock) {
+        AtomicInteger tokens = new AtomicInteger();
+        return new DockerLabLifecycle(
+                engine,
+                journal,
+                labs,
+                new ProjectPathPolicy(),
+                clock,
+                () -> "%032x".formatted(tokens.incrementAndGet()));
+    }
+
+    private DockerLabLifecycle lifecycle(
             FakeEngine engine,
             MemoryJournal journal,
             MemoryLabRepository labs,
@@ -480,7 +594,7 @@ class DockerLabLifecycleTests {
                 return false;
             }
             records.put(id, current.transitionTo(next, updatedAt));
-            if (next == LabState.STARTING) {
+            if (next == LabState.STARTING || next == LabState.STOPPED) {
                 failures.remove(id);
             }
             return true;
@@ -605,8 +719,11 @@ class DockerLabLifecycleTests {
         private boolean failNetworkAfterDispatch;
         private DockerResourceRecord delayedNetwork;
         private Runnable afterStart = () -> {};
+        private Runnable afterInspect = () -> {};
+        private RuntimeException startFailure;
         private DockerHealthStatus healthStatus = DockerHealthStatus.HEALTHY;
         private boolean containersRunning = true;
+        private boolean failVolumeVerification;
 
         void addImage(String reference, String id) {
             DockerImageMetadata metadata = new DockerImageMetadata(id, 123, Set.of(), false);
@@ -698,7 +815,7 @@ class DockerLabLifecycleTests {
             String id = active.engineId().orElseThrow();
             requireOwned(id, active);
             assertThat(createdSpecifications.get(id)).isEqualTo(specification);
-            return new DockerContainerView(
+            DockerContainerView view = new DockerContainerView(
                     id,
                     active.logicalName(),
                     active.logicalName(),
@@ -708,6 +825,8 @@ class DockerLabLifecycleTests {
                     containersRunning ? java.util.OptionalInt.empty() : java.util.OptionalInt.of(0),
                     specification.healthCheckRequired() ? healthStatus : DockerHealthStatus.NONE,
                     List.of());
+            afterInspect.run();
+            return view;
         }
 
         @Override
@@ -717,6 +836,9 @@ class DockerLabLifecycleTests {
             assertThat(createdSpecifications.get(active.engineId().orElseThrow()))
                     .isEqualTo(specification);
             calls.add("start:" + active.engineId().orElseThrow());
+            if (startFailure != null) {
+                throw startFailure;
+            }
             afterStart.run();
         }
 
@@ -745,6 +867,9 @@ class DockerLabLifecycleTests {
         @Override
         public void verifyVolume(DockerResourceRecord active) {
             requireOwned(active.engineId().orElseThrow(), active);
+            if (failVolumeVerification) {
+                throw new IllegalStateException("simulated volume verification failure");
+            }
             calls.add("verify:" + active.engineId().orElseThrow());
         }
 
@@ -753,6 +878,53 @@ class DockerLabLifecycleTests {
             if (reserved == null || !reserved.ownershipToken().equals(active.ownershipToken())) {
                 throw new DockerOwnershipException("not owned");
             }
+        }
+    }
+
+    private static final class BlockingClock extends Clock {
+        private final AtomicBoolean blockNext = new AtomicBoolean();
+        private final CountDownLatch blocked = new CountDownLatch(1);
+        private final CountDownLatch released = new CountDownLatch(1);
+
+        private void blockNextInstant() {
+            blockNext.set(true);
+        }
+
+        private boolean awaitBlocked() throws InterruptedException {
+            return blocked.await(2, TimeUnit.SECONDS);
+        }
+
+        private void release() {
+            released.countDown();
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            if (!ZoneOffset.UTC.equals(zone)) {
+                throw new IllegalArgumentException("Only UTC is supported by this test clock.");
+            }
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            if (blockNext.compareAndSet(true, false)) {
+                blocked.countDown();
+                try {
+                    if (!released.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("The test clock was not released.");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("The test clock was interrupted.", exception);
+                }
+            }
+            return NOW;
         }
     }
 

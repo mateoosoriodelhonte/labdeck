@@ -42,7 +42,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -313,19 +312,53 @@ class DockerJavaLabEngineIntegrationTests {
                       memory: 64MiB
                       cpus: 0.25
                     """);
-            AtomicBoolean cancelled = new AtomicBoolean();
             Future<?> start = executor.submit(() -> scenario.lifecycle.start(
-                    scenario.lab, waiting, cancelled::get));
+                    scenario.lab, waiting, CancellationToken.NONE));
             scenario.awaitManagedContainer(Duration.ofSeconds(10));
 
-            cancelled.set(true);
+            Future<LabRecord> stop = executor.submit(() -> scenario.lifecycle.stop(scenario.labId));
 
+            assertThat(stop.get(20, TimeUnit.SECONDS).state()).isEqualTo(LabState.STOPPED);
             assertThatThrownBy(() -> start.get(20, TimeUnit.SECONDS))
                     .isInstanceOf(ExecutionException.class)
                     .hasCauseInstanceOf(DockerOperationCancelledException.class);
             assertThat(scenario.labs.findById(scenario.labId).orElseThrow().state())
                     .isEqualTo(LabState.STOPPED);
             assertThat(scenario.labs.findRuntimeFailure(scenario.labId)).isEmpty();
+            assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
+        }
+    }
+
+    @Test
+    void unexpectedRuntimeExitFailsDurablyWithinTheMonitorBound() throws Exception {
+        String name = "Runtime exit Docker integration lab";
+        try (DockerScenario scenario = new DockerScenario(name)) {
+            ManifestPlan exits = compile("""
+                    version: 1
+                    name: Runtime exit Docker integration lab
+                    workspace:
+                      mount: /workspace
+                    services:
+                      app:
+                        image: busybox:1.37
+                        command: ["sleep", "3"]
+                    resources:
+                      memory: 64MiB
+                      cpus: 0.25
+                    """);
+
+            DockerStartResult started = scenario.lifecycle.start(
+                    scenario.lab, exits, CancellationToken.NONE);
+            assertThat(started.lab().state()).isEqualTo(LabState.RUNNING);
+
+            LabRecord failed = scenario.awaitState(LabState.FAILED, Duration.ofSeconds(8));
+
+            assertThat(failed.state()).isEqualTo(LabState.FAILED);
+            assertThat(scenario.labs.findRuntimeFailure(scenario.labId).orElseThrow())
+                    .satisfies(failure -> {
+                        assertThat(failure.code()).isEqualTo(LabFailureCode.CONTAINER_EXITED);
+                        assertThat(failure.service()).contains("app");
+                    });
             assertNoJournaledEngineResources(scenario.docker, scenario.labId, scenario.projectId);
         }
     }
@@ -428,6 +461,18 @@ class DockerJavaLabEngineIntegrationTests {
                 Thread.sleep(25);
             }
             throw new IllegalStateException("The integration container did not start in time.");
+        }
+
+        private LabRecord awaitState(LabState expected, Duration timeout) throws Exception {
+            long deadline = System.nanoTime() + timeout.toNanos();
+            while (System.nanoTime() < deadline) {
+                LabRecord current = labs.findById(labId).orElseThrow();
+                if (current.state() == expected) {
+                    return current;
+                }
+                Thread.sleep(25);
+            }
+            throw new IllegalStateException("The integration lab did not reach " + expected + " in time.");
         }
 
         @Override

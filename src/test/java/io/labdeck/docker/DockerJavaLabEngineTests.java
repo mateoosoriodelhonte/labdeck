@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -55,6 +56,72 @@ class DockerJavaLabEngineTests {
                     .isInstanceOf(ExecutionException.class)
                     .hasCauseInstanceOf(DockerOperationCancelledException.class);
             assertThat(streamClosed).isTrue();
+        }
+    }
+
+    @Test
+    void translatesRegistryPullFailuresWithoutExposingRawDaemonText() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        PullImageCmd pull = mock(PullImageCmd.class);
+        when(docker.pullImageCmd("busybox:1.37")).thenReturn(pull);
+        when(pull.withAuthConfig(any(AuthConfig.class))).thenReturn(pull);
+        doThrow(new IllegalStateException("denied: raw-registry-detail"))
+                .when(pull).exec(any(PullImageResultCallback.class));
+        DockerJavaLabEngine engine = new DockerJavaLabEngine(docker, http);
+
+        assertThatThrownBy(() -> engine.pullPublicImageAfterConfirmation(
+                "busybox:1.37", Duration.ofSeconds(2), CancellationToken.NONE))
+                .isInstanceOfSatisfying(DockerImagePullException.class, failure -> {
+                    assertThat(failure.reason()).isEqualTo(DockerImagePullException.Reason.FAILED);
+                    assertThat(failure.getMessage()).contains("Check its name and public access");
+                    assertThat(failure.getMessage()).doesNotContain("raw-registry-detail");
+                    assertThat(failure.getCause()).isNull();
+                });
+    }
+
+    @Test
+    void translatesDockerStorageExhaustionWithoutPruningOrRawPaths() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        PullImageCmd pull = mock(PullImageCmd.class);
+        when(docker.pullImageCmd("busybox:1.37")).thenReturn(pull);
+        when(pull.withAuthConfig(any(AuthConfig.class))).thenReturn(pull);
+        doThrow(new IllegalStateException("write /var/lib/docker: no space left on device"))
+                .when(pull).exec(any(PullImageResultCallback.class));
+        DockerJavaLabEngine engine = new DockerJavaLabEngine(docker, http);
+
+        assertThatThrownBy(() -> engine.pullPublicImageAfterConfirmation(
+                "busybox:1.37", Duration.ofSeconds(2), CancellationToken.NONE))
+                .isInstanceOf(DockerStorageFullException.class)
+                .hasMessageContaining("did not delete or prune anything")
+                .hasMessageNotContaining("/var/lib/docker")
+                .hasNoCause();
+    }
+
+    @Test
+    void reportsPullTimeoutAndInterruptionAsTypedSafeFailures() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerHttpClient http = mock(DockerHttpClient.class);
+        PullImageCmd pull = mock(PullImageCmd.class);
+        when(docker.pullImageCmd("busybox:1.37")).thenReturn(pull);
+        when(pull.withAuthConfig(any(AuthConfig.class))).thenReturn(pull);
+        DockerJavaLabEngine engine = new DockerJavaLabEngine(docker, http);
+
+        assertThatThrownBy(() -> engine.pullPublicImageAfterConfirmation(
+                "busybox:1.37", Duration.ofSeconds(1), CancellationToken.NONE))
+                .isInstanceOfSatisfying(DockerImagePullException.class, failure ->
+                        assertThat(failure.reason()).isEqualTo(DockerImagePullException.Reason.TIMED_OUT));
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThatThrownBy(() -> engine.pullPublicImageAfterConfirmation(
+                    "busybox:1.37", Duration.ofSeconds(2), CancellationToken.NONE))
+                    .isInstanceOfSatisfying(DockerImagePullException.class, failure ->
+                            assertThat(failure.reason())
+                                    .isEqualTo(DockerImagePullException.Reason.INTERRUPTED));
+        } finally {
+            Thread.interrupted();
         }
     }
 

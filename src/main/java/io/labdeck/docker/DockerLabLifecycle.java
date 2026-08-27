@@ -29,6 +29,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -165,14 +166,14 @@ public class DockerLabLifecycle implements AutoCloseable {
         }
         cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
         Map<String, ServiceDockerPolicy> policies = compileDockerPolicies(plan);
-        ReentrantLock lock = lockFor(requestedLab.id());
-        lock.lock();
         ActiveStart operation = new ActiveStart(cancellation);
         if (activeStarts.putIfAbsent(requestedLab.id(), operation) != null) {
-            unlock(lock);
             throw new IllegalStateException("Another start operation is already active for this lab.");
         }
+        ReentrantLock lock = lockFor(requestedLab.id());
+        lock.lock();
         try {
+            operation.throwIfCancellationRequested();
             LabRecord current = labs.findById(requestedLab.id())
                     .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
             if (current.revision() != requestedLab.revision()
@@ -261,13 +262,11 @@ public class DockerLabLifecycle implements AutoCloseable {
                 List<DockerContainerView> views = readiness.await(
                         probes, readinessTimeout(containers), operation);
                 operation.throwIfCancellationRequested();
-                views = inspectReadySnapshot(containers, operation);
-                operation.throwIfCancellationRequested();
 
                 Instant runningAt = now();
                 LabRecord running = starting.transitionTo(LabState.RUNNING, runningAt);
-                if (!labs.compareAndSetState(
-                        starting.id(), starting.revision(), LabState.STARTING, LabState.RUNNING, runningAt)) {
+                if (!operation.commitRunning(() -> labs.compareAndSetState(
+                        starting.id(), starting.revision(), LabState.STARTING, LabState.RUNNING, runningAt))) {
                     throw new IllegalStateException("The ready lab state could not be stored.");
                 }
                 committedRun = running;
@@ -318,7 +317,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                     .orElseThrow(() -> new IllegalStateException("The lab does not exist."));
             LabState cleanupState = current.state();
             LabRecord stopping = current;
-            if (Set.of(LabState.STARTING, LabState.RUNNING).contains(current.state())) {
+            if (Set.of(LabState.STARTING, LabState.RUNNING, LabState.FAILED).contains(current.state())) {
                 Instant transitionTime = now();
                 stopping = current.transitionTo(LabState.STOPPING, transitionTime);
                 if (!labs.compareAndSetState(
@@ -336,7 +335,7 @@ public class DockerLabLifecycle implements AutoCloseable {
                 return stopped;
             } else if (current.state() == LabState.STOPPED) {
                 return current;
-            } else if (current.state() != LabState.FAILED) {
+            } else {
                 throw new IllegalStateException("The lab cannot stop from its current state.");
             }
 
@@ -744,6 +743,14 @@ public class DockerLabLifecycle implements AutoCloseable {
     }
 
     private static FailureClassification classify(RuntimeException failure) {
+        if (hasCause(failure, DockerStorageFullException.class)) {
+            return new FailureClassification(
+                    LabFailureCode.DOCKER_STORAGE_FULL, Optional.empty());
+        }
+        if (hasCause(failure, DockerImagePullException.class)) {
+            return new FailureClassification(
+                    LabFailureCode.IMAGE_PULL_FAILED, Optional.empty());
+        }
         if (failure instanceof DockerPortCollisionException collision) {
             return new FailureClassification(
                     LabFailureCode.HOST_PORT_IN_USE, Optional.of(collision.service()));
@@ -764,6 +771,15 @@ public class DockerLabLifecycle implements AutoCloseable {
         }
         return new FailureClassification(
                 LabFailureCode.CONTAINER_START_FAILED, Optional.empty());
+    }
+
+    private static boolean hasCause(RuntimeException failure, Class<? extends RuntimeException> type) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (type.isInstance(current)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Map<String, ServiceDockerPolicy> compileDockerPolicies(ManifestPlan plan) {
@@ -830,29 +846,6 @@ public class DockerLabLifecycle implements AutoCloseable {
                 .orElse(Duration.ZERO);
         Duration bounded = healthBudget.compareTo(minimum) < 0 ? minimum : healthBudget;
         return bounded.compareTo(maximum) > 0 ? maximum : bounded;
-    }
-
-    private List<DockerContainerView> inspectReadySnapshot(
-            List<PlannedContainer> containers, CancellationToken cancellation) {
-        List<DockerContainerView> views = new ArrayList<>(containers.size());
-        for (PlannedContainer container : containers) {
-            cancellation.throwIfCancellationRequested();
-            DockerContainerView view = engine.inspectContainer(
-                    container.resource(), container.specification());
-            if (!view.running()) {
-                throw DockerServiceReadinessException.exited(view.service(), view.exitCode());
-            }
-            if (container.specification().healthCheckRequired()) {
-                if (view.health() == DockerHealthStatus.UNHEALTHY) {
-                    throw DockerServiceReadinessException.unhealthy(view.service());
-                }
-                if (view.health() != DockerHealthStatus.HEALTHY) {
-                    throw DockerServiceReadinessException.healthNotReported(view.service());
-                }
-            }
-            views.add(view);
-        }
-        return List.copyOf(views);
     }
 
     private static void preflightWorkspaceTargets(ManifestPlan plan) {
@@ -953,7 +946,12 @@ public class DockerLabLifecycle implements AutoCloseable {
             return stopRequested.get() || external.isCancellationRequested();
         }
 
-        private void cancel() {
+        private synchronized boolean commitRunning(BooleanSupplier commit) {
+            throwIfCancellationRequested();
+            return commit.getAsBoolean();
+        }
+
+        private synchronized void cancel() {
             stopRequested.set(true);
         }
     }

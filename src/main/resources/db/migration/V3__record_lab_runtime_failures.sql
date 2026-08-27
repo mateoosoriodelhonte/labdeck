@@ -4,6 +4,8 @@ CREATE TABLE lab_runtime_failure (
     failure_code TEXT NOT NULL CHECK (
         failure_code IN (
             'DOCKER_UNAVAILABLE',
+            'DOCKER_STORAGE_FULL',
+            'IMAGE_PULL_FAILED',
             'HOST_PORT_IN_USE',
             'CONTAINER_START_FAILED',
             'CONTAINER_EXITED',

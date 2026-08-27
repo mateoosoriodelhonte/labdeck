@@ -49,14 +49,19 @@ A manifest health check replaces the image check with exact Docker `CMD` argv an
 Without a manifest check, preserve an image check. A health-managed service is ready only when
 Docker reports `healthy`. A service with no health policy must stay running for two seconds and is
 never described as healthy. Reinspect every service before storing Running. Use a monotonic
-readiness deadline with a 30-second floor and a 15-minute ceiling. Unknown image-health timing uses
-the ceiling.
+readiness deadline with a 30-second floor and a 15-minute ceiling. Check it before and after every
+Engine inspection, including the final full snapshot. Unknown image-health timing uses the ceiling.
 
 After Running, poll exact journaled container IDs every two seconds. An exit or unhealthy state
 claims the exact running revision, cleans verified ephemeral resources, and stores a safe failure.
 Three Docker inspection failures store a Docker-unavailable state without cleanup. An ownership
 mismatch also fails without unverified cleanup. Startup cancellation signals the readiness loop
-before it waits for the per-lab lifecycle lock.
+before it waits for the per-lab lifecycle lock. One synchronized gate decides whether cancellation
+or the final Running commit wins.
+
+Translate confirmed image-pull failures to fixed messages without raw registry or daemon text.
+Recognize Docker storage exhaustion only from narrow `ENOSPC` or `no space left on device` evidence.
+Store a safe failure and tell the student to free Docker storage. Never prune automatically.
 
 ## Alternatives considered
 

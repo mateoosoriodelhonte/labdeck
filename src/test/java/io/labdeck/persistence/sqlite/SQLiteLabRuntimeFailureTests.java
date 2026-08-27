@@ -85,6 +85,72 @@ class SQLiteLabRuntimeFailureTests {
         }
     }
 
+    @Test
+    void successfulFailedCleanupRetryClearsTheFailureAcrossReopen() {
+        java.nio.file.Path dataDirectory = temporaryDirectory.resolve("cleanup-success-data");
+        try (LockedSQLiteDataSource dataSource = open(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            labs.create(lab());
+            storeInitialFailure(labs);
+
+            assertThat(labs.compareAndSetState(
+                    "lab-a", 3, LabState.FAILED, LabState.STOPPING, CREATED.plusSeconds(4))).isTrue();
+            assertThat(labs.compareAndSetState(
+                    "lab-a", 4, LabState.STOPPING, LabState.STOPPED, CREATED.plusSeconds(5))).isTrue();
+            assertThat(labs.findRuntimeFailure("lab-a")).isEmpty();
+        }
+
+        try (LockedSQLiteDataSource dataSource = open(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            assertThat(labs.findById("lab-a").orElseThrow().state()).isEqualTo(LabState.STOPPED);
+            assertThat(labs.findRuntimeFailure("lab-a")).isEmpty();
+        }
+    }
+
+    @Test
+    void failedCleanupRetryReplacesTheFailureAcrossReopen() {
+        java.nio.file.Path dataDirectory = temporaryDirectory.resolve("cleanup-failure-data");
+        LabRuntimeFailure cleanupFailure = new LabRuntimeFailure(
+                "lab-a",
+                5,
+                LabFailureCode.CLEANUP_INCOMPLETE,
+                Optional.empty(),
+                CREATED.plusSeconds(5),
+                true);
+        try (LockedSQLiteDataSource dataSource = open(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            labs.create(lab());
+            storeInitialFailure(labs);
+
+            assertThat(labs.compareAndSetState(
+                    "lab-a", 3, LabState.FAILED, LabState.STOPPING, CREATED.plusSeconds(4))).isTrue();
+            assertThat(labs.compareAndSetStateWithFailure(
+                    "lab-a", 4, LabState.STOPPING, CREATED.plusSeconds(5), cleanupFailure)).isTrue();
+        }
+
+        try (LockedSQLiteDataSource dataSource = open(dataDirectory)) {
+            SQLiteLabRepository labs = new SQLiteLabRepository(dataSource);
+            assertThat(labs.findById("lab-a").orElseThrow().state()).isEqualTo(LabState.FAILED);
+            assertThat(labs.findRuntimeFailure("lab-a")).contains(cleanupFailure);
+        }
+    }
+
+    private static void storeInitialFailure(SQLiteLabRepository labs) {
+        assertThat(labs.compareAndSetState(
+                "lab-a", 0, LabState.IMPORTED, LabState.STARTING, CREATED.plusSeconds(1))).isTrue();
+        assertThat(labs.compareAndSetState(
+                "lab-a", 1, LabState.STARTING, LabState.STOPPING, CREATED.plusSeconds(2))).isTrue();
+        LabRuntimeFailure initial = new LabRuntimeFailure(
+                "lab-a",
+                3,
+                LabFailureCode.HEALTHCHECK_UNHEALTHY,
+                Optional.of("database"),
+                CREATED.plusSeconds(3),
+                false);
+        assertThat(labs.compareAndSetStateWithFailure(
+                "lab-a", 2, LabState.STOPPING, CREATED.plusSeconds(3), initial)).isTrue();
+    }
+
     private LabRecord lab() {
         return new LabRecord(
                 "lab-a",

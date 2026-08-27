@@ -23,6 +23,7 @@ less time fighting dependencies and more time working on the assignment.
 - Dynamic or fixed TCP ports bound only to `127.0.0.1`, with clear fixed-port conflicts.
 - Lab-wide memory and CPU ceilings divided across services, with Docker swap disabled.
 - Docker health readiness, bounded cancellation, unexpected-exit monitoring, and safe failure records.
+- Typed image-download and Docker-storage-full guidance without automatic pruning.
 - Workspace identity checks before structured bind mounts; no general Docker prune operations.
 - One executable JAR that contains the production frontend.
 - Deterministic synthetic lab examples. No real coursework or personal data.

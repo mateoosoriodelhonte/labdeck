@@ -46,14 +46,18 @@ final class DockerReadinessWaiter {
         long timeoutNanos = timeout.toNanos();
         long startedAt = nanoTime.getAsLong();
         Map<String, Long> firstRunningAt = new HashMap<>();
+        List<String> lastBlocking = probes.stream().map(ServiceProbe::service).toList();
 
         while (true) {
             cancellation.throwIfCancellationRequested();
-            List<DockerContainerView> views = new ArrayList<>(probes.size());
+            requireBeforeDeadline(startedAt, timeoutNanos, lastBlocking);
             List<String> blocking = new ArrayList<>();
             for (ServiceProbe probe : probes) {
                 cancellation.throwIfCancellationRequested();
+                requireBeforeDeadline(startedAt, timeoutNanos, lastBlocking);
                 DockerContainerView view = Objects.requireNonNull(probe.inspection().get(), "inspection");
+                cancellation.throwIfCancellationRequested();
+                requireBeforeDeadline(startedAt, timeoutNanos, List.of(probe.service()));
                 if (!probe.service().equals(view.service())) {
                     throw new IllegalStateException("Docker returned readiness for the wrong service.");
                 }
@@ -78,16 +82,16 @@ final class DockerReadinessWaiter {
                         blocking.add(probe.service());
                     }
                 }
-                views.add(view);
             }
             if (blocking.isEmpty()) {
-                return List.copyOf(views);
+                return inspectFinalSnapshot(probes, cancellation, startedAt, timeoutNanos);
             }
 
             long elapsed = nanoTime.getAsLong() - startedAt;
             if (elapsed < 0 || elapsed >= timeoutNanos) {
                 throw DockerServiceReadinessException.timedOut(blocking);
             }
+            lastBlocking = List.copyOf(blocking);
             Duration remaining = Duration.ofNanos(timeoutNanos - elapsed);
             Duration delay = remaining.compareTo(pollInterval) < 0 ? remaining : pollInterval;
             try {
@@ -96,6 +100,44 @@ final class DockerReadinessWaiter {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Docker readiness waiting was interrupted.", exception);
             }
+        }
+    }
+
+    private List<DockerContainerView> inspectFinalSnapshot(
+            List<ServiceProbe> probes,
+            CancellationToken cancellation,
+            long startedAt,
+            long timeoutNanos) {
+        List<DockerContainerView> views = new ArrayList<>(probes.size());
+        for (ServiceProbe probe : probes) {
+            cancellation.throwIfCancellationRequested();
+            requireBeforeDeadline(startedAt, timeoutNanos, List.of(probe.service()));
+            DockerContainerView view = Objects.requireNonNull(probe.inspection().get(), "inspection");
+            cancellation.throwIfCancellationRequested();
+            requireBeforeDeadline(startedAt, timeoutNanos, List.of(probe.service()));
+            if (!probe.service().equals(view.service())) {
+                throw new IllegalStateException("Docker returned readiness for the wrong service.");
+            }
+            if (!view.running()) {
+                throw DockerServiceReadinessException.exited(probe.service(), view.exitCode());
+            }
+            if (probe.healthRequired()) {
+                if (view.health() == DockerHealthStatus.UNHEALTHY) {
+                    throw DockerServiceReadinessException.unhealthy(probe.service());
+                }
+                if (view.health() != DockerHealthStatus.HEALTHY) {
+                    throw DockerServiceReadinessException.healthNotReported(probe.service());
+                }
+            }
+            views.add(view);
+        }
+        return List.copyOf(views);
+    }
+
+    private void requireBeforeDeadline(long startedAt, long timeoutNanos, List<String> blocking) {
+        long elapsed = nanoTime.getAsLong() - startedAt;
+        if (elapsed < 0 || elapsed >= timeoutNanos) {
+            throw DockerServiceReadinessException.timedOut(blocking);
         }
     }
 
