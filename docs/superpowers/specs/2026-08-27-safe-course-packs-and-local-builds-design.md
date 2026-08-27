@@ -2,7 +2,7 @@
 
 ## Status
 
-The direction was approved on 2026-08-27. This exact design is pending review before implementation.
+The direction and this exact design were approved on 2026-08-27.
 
 Issue: [#10](https://github.com/mateoosoriodelhonte/labdeck/issues/10)
 
