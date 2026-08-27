@@ -16,6 +16,10 @@ less time fighting dependencies and more time working on the assignment.
 - Java 25 and Spring Boot 4.1.1 local service bound to `127.0.0.1`.
 - Vue 3.5.41, Vite, and TypeScript interface with desktop and mobile layouts.
 - Versioned `GET /api/v1/system` status contract.
+- Versioned local lab API with strict JSON, session CSRF, Host and Origin checks, and safe problem
+  details.
+- Workspace import, plan review, revision-checked start and stop, owned service inspection, and
+  bounded test-history reads.
 - Closed v1 manifest schema, bounded YAML parser, semantic validator, and deterministic plan.
 - Locked local SQLite metadata store with migrations, lifecycle revisions, and bounded test history.
 - Public-image inspection and confirmed pulls without Docker registry credentials.
@@ -99,7 +103,8 @@ Architecture decisions are recorded in
 [ADR-0002](docs/decisions/0002-restricted-manifest.md), and
 [ADR-0003](docs/decisions/0003-use-locked-sqlite-metadata-store.md), and
 [ADR-0004](docs/decisions/0004-journal-docker-resource-ownership.md), and
-[ADR-0005](docs/decisions/0005-local-ports-resource-budgets-and-readiness.md).
+[ADR-0005](docs/decisions/0005-local-ports-resource-budgets-and-readiness.md), and
+[ADR-0006](docs/decisions/0006-safe-local-api.md).
 
 ## Safety and privacy
 
@@ -107,7 +112,8 @@ LabDeck is local-first. It has no account, analytics, telemetry, paid API, or cl
 The v1 manifest is intentionally restricted. LabDeck will manage only resources with exact LabDeck
 ownership labels and will never perform a general Docker prune.
 
-See the [manifest v1 guide](docs/manifest-v1.md) for the accepted fields and safety rules.
+See the [manifest v1 guide](docs/manifest-v1.md) for the accepted fields and safety rules. See the
+[local API v1 guide](docs/api-v1.md) for requests, responses, CSRF, validation, and error codes.
 
 Docker isolation is not a perfect security sandbox. The full threat model and adversarial manifest
 tests are tracked in the [LabDeck v1.0 milestone](https://github.com/mateoosoriodelhonte/labdeck/milestone/1).
@@ -133,3 +139,5 @@ Docker lifecycle and ownership are tracked in
 [issue #5](https://github.com/mateoosoriodelhonte/labdeck/issues/5).
 Ports, resource limits, and health readiness are tracked in
 [issue #6](https://github.com/mateoosoriodelhonte/labdeck/issues/6).
+The safe local API is tracked in
+[issue #7](https://github.com/mateoosoriodelhonte/labdeck/issues/7).
